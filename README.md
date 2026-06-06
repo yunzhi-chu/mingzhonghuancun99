@@ -7,13 +7,7 @@
 ## 安装
 
 ```bash
-pip install mingzhonghuancun99
-```
-
-或直接运行源码：
-
-```bash
-git clone https://github.com/your-org/mingzhonghuancun99.git
+git clone https://github.com/yunzhi-chu/mingzhonghuancun99.git
 cd mingzhonghuancun99
 python -m cache_optimizer --help
 ```
@@ -100,7 +94,7 @@ python -m cache_optimizer --setup
 
 ## CCSwitch 集成
 
-本工具与 [CCSwitch](https://github.com/your-org/ccswitch) 深度集成：
+本工具与 CCSwitch 深度集成：
 
 - 自动检测 CCSwitch 是否安装
 - 未安装时一键自动安装
@@ -108,15 +102,6 @@ python -m cache_optimizer --setup
 - 分析命中率并生成优化建议
 
 CCSwitch 提供的数据维度：时间、供应商、模型、新增输入、缓存读取、输出、成本、TTF、状态。
-
-## 定价
-
-**¥9.9/次** — 扫码支付后获得完整的诊断报告与修复方案。
-
-适合：
-- 独立开发者优化 API 成本
-- 团队配置标准化
-- CI/CD 中的缓存效率监控
 
 ## 诊断指标
 
