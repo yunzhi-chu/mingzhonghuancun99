@@ -16,6 +16,9 @@ import subprocess
 from pathlib import Path
 from dataclasses import dataclass, field
 
+# CC-Switch 下载链接（桌面应用，非 pip 包）
+CCSWITCH_RELEASES = "https://github.com/farion1231/cc-switch/releases/latest"
+
 
 @dataclass
 class AgentInfo:
@@ -335,5 +338,5 @@ def print_ccswitch(ccs: dict):
         if ccs.get("agents"):
             print(f"     已启用代理: {', '.join(ccs['agents'])}")
     else:
-        print("  ❌ CC-Switch 未安装")
-        print("     这是一个桌面应用。如果已安装，确保 ~/.cc-switch/ 目录存在。")
+        print(f"  ❌ CC-Switch 未安装")
+        print(f"     下载: {CCSWITCH_RELEASES}")

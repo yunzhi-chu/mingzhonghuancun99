@@ -25,15 +25,18 @@ from .agents import AgentInfo, detect_ccswitch
 CC_SWITCH_DIR = Path.home() / ".cc-switch"
 CC_DB = CC_SWITCH_DIR / "cc-switch.db"
 
+# CC-Switch 项目地址
+CCSWITCH_REPO = "https://github.com/farion1231/cc-switch"
+CCSWITCH_RELEASES = "https://github.com/farion1231/cc-switch/releases/latest"
+
 
 def ensure_ccswitch(auto_install: bool = True) -> dict:
-    """检测 CC-Switch 是否已安装。
+    """检测 CC-Switch 是否已安装。如果没装，提示用户。
 
-    CC-Switch 是桌面应用，无法自动安装。
-    如果没装，给出引导提示。
+    CC-Switch 是桌面应用（Tauri），可从 GitHub 下载。
 
     参数：
-      auto_install: 保留参数，仅用于兼容。实际什么也不装。
+      auto_install: 如果 True，尝试打开下载页面。
 
     返回值：
       detect_ccswitch() 的结果字典
@@ -42,24 +45,33 @@ def ensure_ccswitch(auto_install: bool = True) -> dict:
     if ccs["installed"]:
         return ccs
 
-    if not auto_install:
-        return ccs
-
-    print("  ⚠️ CC-Switch 未检测到。请确认桌面端已启动。")
-    print("     CC-Switch 是一个桌面应用（系统托盘图标），不是 pip 包。")
-    print("     如果已安装，检查 ~/.cc-switch/ 目录是否存在。")
+    print("  ⚠️ CC-Switch 未检测到。")
+    print(f"     CC-Switch 是一个桌面应用，可从 GitHub 下载:")
+    print(f"     {CCSWITCH_RELEASES}")
+    print(f"     项目地址: {CCSWITCH_REPO}")
+    print()
+    if auto_install:
+        try:
+            import webbrowser
+            webbrowser.open(CCSWITCH_RELEASES)
+            print("  🔗 已打开下载页面")
+        except Exception:
+            pass
     return ccs
 
 
 # 当 CC-Switch 装不上时，告诉用户手动操作的方法
-__MANUAL_GUIDE__ = """
-CC-Switch 未检测到或数据库不可用。你仍可手动使用本工具：
+__MANUAL_GUIDE__ = f"""
+CC-Switch 未检测到。你可手动操作：
 
-  1. 从 CC-Switch 仪表盘复制请求日志（Tab 分隔格式）
-  2. 运行: python -m cache_optimizer
-  3. 粘贴数据，Ctrl+D 结束
+  1. 从 GitHub 下载 CC-Switch 桌面版:
+     {CCSWITCH_RELEASES}
 
-或者保存到文件后: python -m cache_optimizer --data data.txt
+  2. 安装并启动后，运行:
+     python -m cache_optimizer
+
+  3. 或从 CC-Switch 仪表盘复制请求日志, 粘贴到:
+     python -m cache_optimizer --data data.txt
 """
 
 
