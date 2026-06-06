@@ -579,7 +579,7 @@ def _scan_hermes_config(hermes_dir: Path, result: ConfigScanResult):
     ccr = hermes_dir / "ccr"
     if ccr.exists():
         for f in ccr.iterdir():
-            if f.is_file():
+            if f.is_file() and f.suffix in (".md", ".txt", ".json", ".yaml", ".yml"):
                 sz = f.stat().st_size
                 result.memory_file_count += 1
                 result.memory_total_size += sz
@@ -1718,17 +1718,17 @@ def main():
       --optimize          完整优化流程
     """
     parser = argparse.ArgumentParser(description="命中缓存99% — 通用 AI agent 缓存诊断与优化工具")
-    parser.add_argument("-d", "--data", help="CCSwitch 数据文件（.txt/.csv），或留空从 stdin 粘贴")
+    parser.add_argument("-d", "--data", help="CCSwitch 数据文件，或留空从 stdin 粘贴")
     parser.add_argument("-c", "--config", help="Claude Code 配置目录（默认 ~/.claude）")
-    parser.add_argument("-t", "--target", type=float, default=99.0, help="目标命中率（默认 99pct）")
-    parser.add_argument("--json", action="store_true", help="输出 JSON 格式")
-    parser.add_argument("--summary", action="store_true", help="只从摘要文本分析（无需表格）")
+    parser.add_argument("-t", "--target", type=float, default=99.0, help="目标命中率 (默认 99)")
+    parser.add_argument("--json", action="store_true", help="输出 JSON 格式 (机器可读)")
+    parser.add_argument("--summary", action="store_true", help="只从摘要文本分析 (无需完整表格)")
     parser.add_argument("--fix", nargs="?", const="dry-run", choices=["dry-run", "apply"],
-                        help="一键修复：dry-run（预览）| apply（执行）")
-    parser.add_argument("--dashboard", nargs="?", const="report.html", help="生成 HTML 仪表盘（默认 report.html）")
+                        help="一键修复记忆文件: dry-run(预览) | apply(执行,自动备份)")
+    parser.add_argument("--dashboard", nargs="?", const="report.html", help="生成 HTML 仪表盘 (默认 report.html)")
     parser.add_argument("--detect", action="store_true", help="检测已安装的 AI agent 和 CCSwitch")
-    parser.add_argument("--setup", action="store_true", help="自动安装 CCSwitch 并配置 agent 代理")
-    parser.add_argument("--optimize", action="store_true", help="完整优化流程：检测→安装→分析→修复")
+    parser.add_argument("--setup", action="store_true", help="检测 CC-Switch 状态和 agent 代理配置")
+    parser.add_argument("--optimize", action="store_true", help="完整优化: 检测 -> 取数据 -> 分析 -> 交互修复")
     args = parser.parse_args()
 
     # 确定配置目录
@@ -1985,12 +1985,11 @@ def main():
         print(format_report(result))
 
     # 5. 退出码
-    # 分数 < 50  → 退出码 2（严重问题）
-    # 分数 < 70  → 退出码 1（有问题）
-    # 分数 >= 70 → 退出码 0（正常）
-    if result.overall_score < 50:
+    # 没数据但评分低 → 退出码 1（提示），有严重问题 → 退出码 2
+    lacks_data = not result.has_ccswitch_data
+    if not lacks_data and result.overall_score < 50:
         sys.exit(2)
-    elif result.overall_score < 70:
+    elif result.overall_score < 70 or lacks_data:
         sys.exit(1)
 
 
