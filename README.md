@@ -125,6 +125,6 @@ mingzhonghuancun99/
   LICENSE
 ```
 
-## License
+## 许可证
 
-MIT
+MIT — 使用、分享、方便。
