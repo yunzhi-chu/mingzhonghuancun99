@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mingzhonghuancun99"
+version = "0.1.0"
+description = "命中缓存99% — 缓存命中率诊断、修复与监控仪表盘"
+readme = "README.md"
+authors = []
+license = {text = "MIT"}
+requires-python = ">=3.10"
+keywords = ["cache", "prompt-caching", "claude", "openai", "token-optimization"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.scripts]
+cache-optimizer = "cache_optimizer:main"
+
+[tool.setuptools.packages.find]
+include = ["cache_optimizer*"]
