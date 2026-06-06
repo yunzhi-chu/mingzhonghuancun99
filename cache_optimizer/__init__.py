@@ -10,6 +10,7 @@ import csv
 import json
 import os
 import re
+import webbrowser
 from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime
@@ -1114,7 +1115,7 @@ def main():
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(html)
         print(f"✅ 仪表盘已生成: {os.path.abspath(out_path)}")
-        print(f"   在浏览器中打开查看。")
+        webbrowser.open(os.path.abspath(out_path))
         sys.exit(0)
 
     # 4. 输出
