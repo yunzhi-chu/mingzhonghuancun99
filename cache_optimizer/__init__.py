@@ -1,9 +1,22 @@
 #!/usr/bin/env python3
-"""命中缓存99% — 通用 AI agent 缓存诊断与优化工具。"""
+"""命中缓存99% — 通用 AI agent 缓存诊断与优化工具。
+
+什么是"缓存命中率"？
+  你每次问 AI 问题时，都会把一些"上下文"（之前的对话、系统提示等）发给 AI。
+  如果这些上下文和上一次完全一样，AI 就可以直接从缓存读取，不用重新算。
+  缓存命中率 = 缓存读取的 token 数 / 总发送的 token 数 × 100%
+
+  举个栗子🌰：
+    你每次发 10000 个 token，其中 9900 个是重复的上下文（缓存命中），
+    只有 100 个是新问题。那命中率就是 99%。
+
+  命中率越高，速度越快、成本越低！
+"""
 
 import sys
 import argparse
 
+# 修复 Windows 终端的中文乱码问题
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 import csv
@@ -16,25 +29,59 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
-from . import agents
-from . import ccswitch_manager as ccsm
+# 导入我们自己写的其他模块
+from . import agents                  # agent 检测
+from . import ccswitch_manager as ccsm  # CCSwitch 管理
 
-# ─── 数据模型 ─────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════
+# 数据模型
+# ═══════════════════════════════════════════════════════════════
+# 什么是数据模型？
+#   就像用表格来记录信息——先定义好每一列叫什么、是什么类型。
+#   后面解析数据时，就按这个"表格"来填内容。
 
 @dataclass
 class RequestLog:
+    """一条 API 请求的日志记录。
+
+    相当于 CCSwitch 表格中的一行数据。
+
+    time:       请求时间（如 2026-06-01 10:30:00）
+    provider:   供应商，谁提供的 AI 服务（如 Anthropic / OpenAI）
+    model:      用的什么模型（如 claude-sonnet-4-6 / gpt-4o）
+    new_input:  新输入的 token 数（第一次发的、不在缓存里的内容）
+    cache_read: 从缓存命中的 token 数（重复的内容）
+    output:     AI 回复的 token 数
+    cost:       这次请求花了多少钱（美元）
+    status:     请求状态（success / error 等）
+    source:     来源（如 chat / api / batch）
+    """
     time: str
     provider: str
     model: str
-    new_input: int      # 新增输入 tokens
-    cache_read: int     # 缓存读取 tokens (R prefix)
-    output: int         # 输出 tokens
-    cost: float         # $
+    new_input: int
+    cache_read: int
+    output: int
+    cost: float
     status: str
     source: str
 
+
 @dataclass
 class CCSwitchData:
+    """CCSwitch 数据的汇总结果。
+
+    把很多条 RequestLog 汇总到一起，算出总数和命中率。
+
+    requests:         所有请求的列表
+    total_new_input:  所有请求的新输入 token 总和
+    total_cache_read: 所有请求的缓存读取 token 总和
+    total_output:     所有请求的输出 token 总和
+    total_cost:       所有请求的总花费（美元）
+    total_requests:   总请求数
+    hit_rate:         缓存命中率（百分比，如 98.64 表示 98.64%）
+    """
     requests: list[RequestLog] = field(default_factory=list)
     total_new_input: int = 0
     total_cache_read: int = 0
@@ -45,13 +92,28 @@ class CCSwitchData:
 
     @classmethod
     def parse(cls, text: str) -> "CCSwitchData":
+        """解析 CCSwitch 导出的 Tab 分隔文本。
+
+        这是最核心的数据解析函数！
+        输入：从 CCSwitch 复制的一大段文本（每行是一列，Tab 分隔）
+        输出：CCSwitchData 对象（包含了所有请求和汇总数据）
+
+        支持的格式：
+          1. 标准格式（10列）：time, provider, model, new_input, R_cache, output, cost, ttf, status, source
+          2. 紧凑格式（8列）：time, provider, model, input/output, ..., status, source
+
+        什么是"R"前缀？
+          缓存读取的 token 数前面会加一个 R，比如 "R1234"。
+          表示这 1234 个 token 是从缓存里读的，不用重新算。
+        """
+        # 第一步：按换行符拆成行，去掉空行
         lines = [l.strip() for l in text.split("\n") if l.strip()]
         if not lines:
-            return cls()
+            return cls()  # 没有数据，返回空结果
 
         data = cls()
 
-        # 检测分隔符
+        # 第二步：检测分隔符（Tab 还是逗号还是空格）
         header = lines[0]
         delimiter = "\t" if "\t" in header else ("," if "," in header else None)
         if delimiter is None:
@@ -59,21 +121,23 @@ class CCSwitchData:
             if len(re.split(r"\s{2,}", header)) >= 5:
                 reader = csv.reader(lines, delimiter="\t") if "\t" in lines[0] else csv.reader(lines)
             else:
-                return cls()
+                return cls()  # 实在识别不了分隔符，返回空
         else:
             reader = csv.reader(lines, delimiter=delimiter)
 
+        # 第三步：逐行解析
         rows = list(reader)
-        if len(rows) < 2:
+        if len(rows) < 2:  # 至少要有表头 + 一行数据
             return cls()
 
-        for row in rows[1:]:
+        for row in rows[1:]:  # 第一行是表头，从第二行开始才是数据
             if len(row) < 6:
-                continue
+                continue  # 列数太少，这行数据不完整
             try:
                 col_count = len(row)
                 if col_count >= 10:
-                    # CCSwitch 标准格式: time, provider, model, new_input, R_cache, output, cost, ttf, status, source
+                    # 标准格式（10列）：这是 CCSwitch 最完整的导出格式
+                    # 各列依次是：时间、供应商、模型、新增输入、R缓存读取、输出、费用、首token延迟、状态、来源
                     time_str = row[0].strip()
                     provider = row[1].strip()
                     model = row[2].strip()
@@ -86,11 +150,12 @@ class CCSwitchData:
                     status = row[8].strip() if len(row) > 8 else ""
                     source = row[9].strip() if len(row) > 9 else ""
                 elif col_count >= 8:
-                    # 紧凑格式: time, provider, model, input, output, cost, status, source
+                    # 紧凑格式（8列）：列数少一些，需要猜哪列是什么
                     time_str = row[0].strip()
                     provider = row[1].strip()
                     model = row[2].strip()
-                    # 判断第3列是否包含 R 前缀
+                    # 判断第3列和第4列哪一个是"新增输入"、哪一个是"缓存读取"
+                    # 缓存读取的数据前面有个 R，比如 "R5000"
                     col3 = row[3].strip()
                     col4 = row[4].strip()
                     if col3.startswith("R"):
@@ -102,6 +167,7 @@ class CCSwitchData:
                         cache_read = int(col4.replace("R", "").replace(",", ""))
                         output_tokens = int(row[5].replace(",", ""))
                     else:
+                        # 没有 R 前缀，说明所有输入都是新的（缓存命中率为 0）
                         new_input = int(col3.replace(",", ""))
                         cache_read = 0
                         output_tokens = int(col4.replace(",", ""))
@@ -111,6 +177,7 @@ class CCSwitchData:
                 else:
                     continue
 
+                # 把这一行数据存到 RequestLog 对象里
                 rl = RequestLog(
                     time=time_str,
                     provider=provider,
@@ -124,15 +191,19 @@ class CCSwitchData:
                 )
                 data.requests.append(rl)
             except (ValueError, IndexError):
-                continue
+                continue  # 某一行解析出错，跳过它继续解析下一行
 
-        # 汇总
+        # 第四步：汇总所有请求
         for r in data.requests:
             data.total_new_input += r.new_input
             data.total_cache_read += r.cache_read
             data.total_output += r.output
             data.total_cost += r.cost
         data.total_requests = len(data.requests)
+
+        # 计算缓存命中率
+        # 公式：缓存读取 / (新增输入 + 缓存读取) × 100%
+        # 如果总数为 0，命中率就是 0
         total_context = data.total_new_input + data.total_cache_read
         data.hit_rate = (data.total_cache_read / total_context * 100) if total_context > 0 else 0
 
@@ -140,12 +211,25 @@ class CCSwitchData:
 
     @classmethod
     def parse_summary(cls, text: str) -> Optional["CCSwitchData"]:
-        """从 CCSwitch 摘要文本（非表格）中提取关键指标。"""
+        """从 CCSwitch 摘要文本中提取关键指标。
+
+        有时候你只有 CCSwitch 的摘要数据（不是完整的表格），
+        比如只有几行文字：
+          总请求数：12,889
+          总成本：$9.59
+          缓存命中率：98.64%
+
+        这个函数就是解析这种摘要文本的。
+
+        特别说明：支持中文数字单位"万"
+          比如 "新增输入：3.2万" 会被识别为 32000
+        """
         data = cls()
         lines = text.strip().split("\n")
         for line in lines:
             try:
                 line = line.strip()
+                # 检查有没有"万"字，有的话数字要乘以 10000
                 multiplier = 10000 if "万" in line else 1
                 # 总请求数
                 m = re.match(r"总请求数[：:]\s*([\d,.]+)", line)
@@ -162,12 +246,12 @@ class CCSwitchData:
                 if m:
                     data.total_new_input = int(float(m.group(1)) * multiplier)
                     continue
-                # Output
+                # Output（AI 输出）
                 m = re.match(r"[Oo]utput[：:]\s*([\d.]+)", line)
                 if m:
                     data.total_output = int(float(m.group(1)) * multiplier)
                     continue
-                # 缓存命中（非率）
+                # 缓存命中（注意不是"缓存命中率"，没有"率"字）
                 m = re.match(r"缓存命中(?!率)[：:]\s*([\d.]+)", line)
                 if m:
                     data.total_cache_read = int(float(m.group(1)) * multiplier)
@@ -180,28 +264,63 @@ class CCSwitchData:
             except (ValueError, ArithmeticError):
                 continue
 
+        # 如果能算出命中率但没匹配到，手动算一下
         total_context = data.total_new_input + data.total_cache_read
         if total_context > 0 and data.hit_rate == 0:
             data.hit_rate = data.total_cache_read / total_context * 100
+        # 如果有成本但没请求数，至少算 1 条
         if data.total_cost > 0 and data.total_requests == 0:
             data.total_requests = 1
 
         return data if data.total_requests > 0 else None
 
 
-# ─── 配置扫描 ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# 配置扫描
+# ═══════════════════════════════════════════════════════════════
+# 扫描 AI agent 的配置文件，找出可能影响缓存命中率的问题。
+#
+# 什么是"固定前缀"？
+#   每次发给 AI 的请求，前面都有一段不变的内容（系统提示、记忆文件等）。
+#   这段内容如果每次都一样，AI 就可以缓存它。
+#   但如果里面有"动态内容"（比如当前日期、随机数），那每次都不一样，
+#   缓存就用不上了，命中率就会下降。
 
 @dataclass
 class ConfigIssue:
-    severity: str      # critical / warning / info
-    category: str      # "memory" / "claude_md" / "settings" / "mcp" / "skills"
+    """扫描发现的配置问题。
+
+    severity: 严重程度（critical / warning / info / success）
+    category: 问题类别（memory / claude_md / settings / mcp / skills）
+    title:    问题标题
+    detail:   详细说明
+    impact:   对命中率有什么影响
+    fix:      怎么修复
+    """
+    severity: str
+    category: str
     title: str
     detail: str
-    impact: str        # 对命中率的影响描述
-    fix: str           # 修复建议
+    impact: str
+    fix: str
+
 
 @dataclass
 class ConfigScanResult:
+    """配置扫描的结果汇总。
+
+    claude_md_size:       CLAUDE.md 文件大小（字节）
+    claude_md_lines:      CLAUDE.md 文件行数
+    claude_md_has_dynamic: CLAUDE.md 是否包含动态内容（日期时间等）
+    memory_file_count:    记忆文件的数量
+    memory_total_size:    所有记忆文件的总大小（字节）
+    memory_file_list:     记忆文件列表，每个元素是 (文件名, 大小)
+    skill_count:          启用了多少个技能（插件）
+    mcp_count:            配置了多少个 MCP 服务
+    settings_issues:      settings.json 中的问题列表
+    history_size_mb:      对话历史文件大小（MB）
+    issues:               所有发现的问题列表
+    """
     claude_md_size: int = 0
     claude_md_lines: int = 0
     claude_md_has_dynamic: bool = False
@@ -216,26 +335,42 @@ class ConfigScanResult:
 
 
 def scan_config(base_dir: str = None) -> ConfigScanResult:
+    """扫描 Claude Code 的配置目录，找出影响缓存的问题。
+
+    参数：
+      base_dir: Claude Code 的配置目录（默认 ~/.claude）
+
+    扫描内容：
+      1. CLAUDE.md — 系统提示文件
+      2. 记忆文件目录 — 存储在 projects/*/memory/ 下的 .md 文件
+      3. settings.json — 配置文件
+      4. MCP 服务配置
+      5. 对话历史文件大小
+    """
     if base_dir is None:
-        base_dir = os.path.expanduser("~/.claude")
+        base_dir = os.path.expanduser("~/.claude")  # 默认路径
     claude_dir = Path(base_dir)
     if not claude_dir.exists():
-        return ConfigScanResult()
+        return ConfigScanResult()  # 目录不存在，返回空结果
 
     result = ConfigScanResult()
 
-    # CLAUDE.md
+    # ── 检查 CLAUDE.md ──────────────────────────────────────
+    # CLAUDE.md 是每次请求都会发送的"系统提示"。
+    # 如果它包含日期、时间等动态内容，那每次请求的前缀都不一样，
+    # 缓存就没法命中。
     cm = claude_dir / "CLAUDE.md"
     if cm.exists():
         content = cm.read_text(encoding="utf-8")
         result.claude_md_size = len(content.encode("utf-8"))
         result.claude_md_lines = content.count("\n") + 1
-        # 检测动态内容
+
+        # 检测动态内容：日期、时间、模板变量等
         dynamic_patterns = [
-            (r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", "日期"),
-            (r"\d{2}:\d{2}", "时间"),
-            (r"今天|昨天|明天|星期[一二三四五六日]", "相对日期"),
-            ("CURRENT_DATE|currentDate|{{.*}}", "模板变量"),
+            (r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", "日期"),     # 如 2026-06-06
+            (r"\d{2}:\d{2}", "时间"),                        # 如 14:30
+            (r"今天|昨天|明天|星期[一二三四五六日]", "相对日期"),  # 中文相对日期
+            ("CURRENT_DATE|currentDate|{{.*}}", "模板变量"),    # 模板语法
         ]
         dynamic_items = []
         for pat, name in dynamic_patterns:
@@ -251,7 +386,8 @@ def scan_config(base_dir: str = None) -> ConfigScanResult:
                 impact=f"每次 CI/build 类操作都产生新前缀，命中率损失约 0.1-0.5%",
                 fix="将动态内容移至运行时变量或 system-reminder 区域（该区域不在缓存 key 中）。"
             ))
-        # 文件大小检查
+
+        # 检查文件大小：太大的 CLAUDE.md 也会增加每次请求的负担
         if result.claude_md_size > 2048:
             result.issues.append(ConfigIssue(
                 severity="info",
@@ -262,7 +398,9 @@ def scan_config(base_dir: str = None) -> ConfigScanResult:
                 fix="精简 CLAUDE.md 至 1-2KB 以内，非核心内容放入记忆文件按需加载。"
             ))
 
-    # 记忆文件
+    # ── 检查记忆文件 ────────────────────────────────────────
+    # 记忆文件也是每次请求都会发送的。
+    # 文件越多、越大，固定前缀就越大。
     memory_base = claude_dir / "projects"
     if memory_base.exists():
         for proj_dir in memory_base.iterdir():
@@ -293,12 +431,12 @@ def scan_config(base_dir: str = None) -> ConfigScanResult:
                 fix="定期清理过期记忆，合并冗余条目。"
             ))
 
-    # settings.json
+    # ── 检查 settings.json ──────────────────────────────────
     sf = claude_dir / "settings.json"
     if sf.exists():
         try:
             s = json.loads(sf.read_text(encoding="utf-8"))
-            # 检查 env 中是否有动态值
+            # 检查 env 中是否有 token/key 等敏感信息
             env = s.get("env", {})
             for k, v in env.items():
                 if "token" in k.lower() or "key" in k.lower() or "secret" in k.lower():
@@ -311,7 +449,7 @@ def scan_config(base_dir: str = None) -> ConfigScanResult:
                             impact="无直接影响",
                             fix="确保 token 值不在 CLAUDE.md 或 system prompt 中引用。"
                         ))
-            # 检查 enabledPlugins
+            # 检查启用的插件数量
             plugins = s.get("enabledPlugins", {})
             result.skill_count = len(plugins)
             if result.skill_count > 10:
@@ -324,9 +462,9 @@ def scan_config(base_dir: str = None) -> ConfigScanResult:
                     fix="只启用当前项目必需的技能，其余按需启用。"
                 ))
         except (json.JSONDecodeError, KeyError):
-            pass
+            pass  # 配置文件有问题，忽略
 
-    # MCP
+    # ── 检查 MCP 服务配置 ───────────────────────────────────
     mcp = claude_dir / "mcp.json"
     if mcp.exists():
         try:
@@ -335,7 +473,7 @@ def scan_config(base_dir: str = None) -> ConfigScanResult:
         except json.JSONDecodeError:
             pass
 
-    # 对话历史
+    # ── 检查对话历史大小 ────────────────────────────────────
     hist = claude_dir / "history.jsonl"
     if hist.exists():
         result.history_size_mb = hist.stat().st_size / (1024 * 1024)
@@ -343,11 +481,41 @@ def scan_config(base_dir: str = None) -> ConfigScanResult:
     return result
 
 
-# ─── 分析引擎 ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# 分析引擎
+# ═══════════════════════════════════════════════════════════════
+# 把上面拿到的数据（CCSwitch 数据 + 配置扫描结果）综合分析，
+# 算出各种指标，给出优化建议。
 
 @dataclass
 class AnalysisResult:
-    # CCSwitch 分析
+    """完整的分析结果。
+
+    ── CCSwitch 分析 ──
+    has_ccswitch_data:   是否有 CCSwitch 数据
+    current_hit_rate:    当前缓存命中率（%）
+    total_requests:      总请求数
+    total_cost:          总成本（美元）
+    avg_input_per_request:  平均每轮新增输入 token
+    avg_output_per_request: 平均每轮输出 token
+    avg_cache_per_request:  平均每轮缓存读取 token
+    avg_cost_per_request:   平均每轮成本
+    variable_per_request:   平均每轮不可缓存的部分
+
+    ── 配置分析 ──
+    config: 配置扫描结果
+
+    ── 优化预测 ──
+    target_hit_rate:          目标命中率（默认 99%）
+    projected_savings_percent: 预估节省百分比
+    projected_savings_monthly: 预估每月节省（美元）
+    projected_new_cost:       优化后的预估每日成本
+    recommendations:          优化建议列表
+
+    ── 诊断摘要 ──
+    diagnosis:     文字诊断结果
+    overall_score: 综合评分（0-100）
+    """
     has_ccswitch_data: bool = False
     current_hit_rate: float = 0.0
     total_requests: int = 0
@@ -356,28 +524,46 @@ class AnalysisResult:
     avg_output_per_request: float = 0.0
     avg_cache_per_request: float = 0.0
     avg_cost_per_request: float = 0.0
-    variable_per_request: float = 0.0  # 平均每轮新增不可缓存部分
+    variable_per_request: float = 0.0
 
-    # 配置分析
     config: ConfigScanResult = field(default_factory=ConfigScanResult)
 
-    # 优化预测
     target_hit_rate: float = 99.0
     projected_savings_percent: float = 0.0
     projected_savings_monthly: float = 0.0
     projected_new_cost: float = 0.0
     recommendations: list = field(default_factory=list)
 
-    # 诊断摘要
     diagnosis: str = ""
-    overall_score: int = 0      # 0-100
+    overall_score: int = 0
 
 
 def analyze(ccswitch: Optional[CCSwitchData], config: ConfigScanResult, target: float = 99.0) -> AnalysisResult:
+    """执行完整的缓存命中率分析。
+
+    参数：
+      ccswitch: CCSwitch 数据（可以没有）
+      config:   配置扫描结果
+      target:   目标命中率（默认 99%）
+
+    分析流程：
+      1. 从 CCSwitch 数据计算当前命中率和成本
+      2. 预测优化到目标命中率能省多少钱
+      3. 结合配置扫描结果生成建议
+      4. 计算综合评分
+
+    什么是 cost_breakdown（成本分解）？
+      不同 token 的价格不一样：
+        - 新输入 token：价格最高（权重 1.0）
+        - 输出 token：价格也很高（权重 1.0）
+        - 缓存读取 token：便宜很多（权重 0.1）
+      所以我们通过权重来估算优化后的成本。
+    """
     r = AnalysisResult()
     r.target_hit_rate = target
     r.config = config
 
+    # ── 第一步：从 CCSwitch 数据计算指标 ────────────────────
     if ccswitch and ccswitch.total_requests > 0:
         r.has_ccswitch_data = True
         r.current_hit_rate = ccswitch.hit_rate
@@ -387,22 +573,28 @@ def analyze(ccswitch: Optional[CCSwitchData], config: ConfigScanResult, target: 
         r.avg_cache_per_request = ccswitch.total_cache_read / ccswitch.total_requests
         r.avg_output_per_request = ccswitch.total_output / ccswitch.total_requests
         r.avg_cost_per_request = ccswitch.total_cost / ccswitch.total_requests
-        r.variable_per_request = ccswitch.total_new_input / ccswitch.total_requests + ccswitch.total_output / ccswitch.total_requests
+        r.variable_per_request = (
+            ccswitch.total_new_input / ccswitch.total_requests
+            + ccswitch.total_output / ccswitch.total_requests
+        )
 
-        # 优化预测
+        # ── 第二步：预测优化效果 ────────────────────────────
+        # 思路很简单：
+        #   现在命中率是 X%，目标是 Y%。
+        #   要把命中率从 X 提到 Y，需要减少"新增输入"的比例。
+        #   我们根据 token 的单价差异来估算省多少钱。
         total_context = ccswitch.total_new_input + ccswitch.total_cache_read
         if total_context > 0:
-            r.projected_savings_percent = ((target - ccswitch.hit_rate) / (100 - ccswitch.hit_rate)) * 100
             current_new_input_ratio = ccswitch.total_new_input / total_context
             target_new_input_ratio = 1 - target / 100
             new_new_input = total_context * target_new_input_ratio
             saved_tokens = ccswitch.total_new_input - new_new_input
-            # 粗略估算：new input 和 output 占成本的大头
-            # cache read 成本约为新输入的 1/10
+
+            # 根据 token 类型的不同价格权重估算成本
             current_cost_breakdown = (
-                ccswitch.total_new_input * 1.0 +  # new input 权重
-                ccswitch.total_output * 1.0 +     # output 权重
-                ccswitch.total_cache_read * 0.1    # cache 10% 价格
+                ccswitch.total_new_input * 1.0 +   # 新输入：全价
+                ccswitch.total_output * 1.0 +      # 输出：全价
+                ccswitch.total_cache_read * 0.1     # 缓存：1/10 价
             )
             new_input_at_target = total_context * (1 - target / 100)
             new_cache_at_target = total_context * (target / 100)
@@ -414,10 +606,11 @@ def analyze(ccswitch: Optional[CCSwitchData], config: ConfigScanResult, target: 
             if current_cost_breakdown > 0:
                 r.projected_savings_percent = (1 - target_cost_breakdown / current_cost_breakdown) * 100
                 r.projected_new_cost = ccswitch.total_cost * (target_cost_breakdown / current_cost_breakdown)
-                # 月预估（按当天数据 * 30）
+                # 月预估 = 每天节省 × 30 天
                 r.projected_savings_monthly = (ccswitch.total_cost - r.projected_new_cost) * 30
 
-    # 生成建议（配置发现的问题直接加入）
+    # ── 第三步：生成优化建议 ────────────────────────────────
+    # 先把配置扫描中发现的问题加入建议列表
     for issue in config.issues:
         r.recommendations.append({
             "severity": issue.severity,
@@ -428,7 +621,7 @@ def analyze(ccswitch: Optional[CCSwitchData], config: ConfigScanResult, target: 
             "fix": issue.fix,
         })
 
-    # 基于数据的建议
+    # 如果有 CCSwitch 数据，再基于数据生成建议
     if r.has_ccswitch_data:
         if r.avg_input_per_request > 2000:
             r.recommendations.append({
@@ -467,7 +660,14 @@ def analyze(ccswitch: Optional[CCSwitchData], config: ConfigScanResult, target: 
                 "fix": "无需额外优化。关注系统 prompt 的稳定性，避免引入新的动态内容。"
             })
 
-    # 综合评分
+    # ── 第四步：计算综合评分（0-100 分） ────────────────────
+    # 评分规则：
+    #   基础分 100，根据问题扣分
+    #   命中率每低于 99% 1 个百分点扣 3 分
+    #   记忆文件超过 10 个扣 5 分
+    #   CLAUDE.md 有动态内容扣 10 分
+    #   技能超过 10 个扣 5 分
+    #   CLAUDE.md 超过 3KB 扣 5 分
     score = 100
     if r.current_hit_rate < 99:
         score -= int((99 - r.current_hit_rate) * 3)
@@ -479,7 +679,7 @@ def analyze(ccswitch: Optional[CCSwitchData], config: ConfigScanResult, target: 
         score -= 5
     if config.claude_md_size > 3000:
         score -= 5
-    score = max(0, min(100, score))
+    score = max(0, min(100, score))  # 确保分数在 0-100 之间
     r.overall_score = score
 
     # 诊断摘要
@@ -495,7 +695,10 @@ def analyze(ccswitch: Optional[CCSwitchData], config: ConfigScanResult, target: 
     return r
 
 
-# ─── 报告输出 ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# 报告输出
+# ═══════════════════════════════════════════════════════════════
+# 把分析结果格式化成漂亮的文字报告，打印到控制台。
 
 HEADER = """
 ╔══════════════════════════════════════════════════╗
@@ -505,14 +708,22 @@ HEADER = """
 
 
 def format_report(r: AnalysisResult) -> str:
+    """把分析结果格式化成文字报告。
+
+    报告包含四个部分：
+      一、综合评分 — 打分 + 进度条
+      二、命中率分析 — 当前命中率、成本、平均指标
+      三、配置诊断 — CLAUDE.md、记忆文件、技能等状态
+      四、优化建议 — 按严重程度排序的建议列表
+    """
     lines = [HEADER, ""]
 
-    # 1. 总览
+    # ── 第一部分：综合评分 ──────────────────────────────────
     lines.append("━" * 50)
     lines.append("一、综合评分")
     lines.append("━" * 50)
 
-    # 评分条
+    # 画一个进度条：█ 表示已达标部分，░ 表示未达标部分
     score = r.overall_score
     bar_len = 30
     filled = int(score / 100 * bar_len)
@@ -521,7 +732,7 @@ def format_report(r: AnalysisResult) -> str:
     lines.append(f"  诊断: {r.diagnosis}")
     lines.append("")
 
-    # 2. 命中率分析
+    # ── 第二部分：命中率分析 ────────────────────────────────
     lines.append("━" * 50)
     lines.append("二、命中率分析")
     lines.append("━" * 50)
@@ -544,7 +755,7 @@ def format_report(r: AnalysisResult) -> str:
         lines.append("  提示: 从 CCSwitch 复制日志数据粘贴到本工具即可分析。")
     lines.append("")
 
-    # 3. 配置诊断
+    # ── 第三部分：配置诊断 ──────────────────────────────────
     lines.append("━" * 50)
     lines.append("三、配置诊断")
     lines.append("━" * 50)
@@ -559,13 +770,13 @@ def format_report(r: AnalysisResult) -> str:
     lines.append(f"  对话历史:       {cfg.history_size_mb:.1f} MB")
     lines.append("")
 
-    # 4. 优化建议
+    # ── 第四部分：优化建议 ──────────────────────────────────
     if r.recommendations:
         lines.append("━" * 50)
         lines.append("四、优化建议（按优先级排序）")
         lines.append("━" * 50)
 
-        # 排序：critical > warning > info > success
+        # 排序：最严重的问题排最前面
         severity_order = {"critical": 0, "warning": 1, "info": 2, "success": 3}
         sorted_recs = sorted(r.recommendations, key=lambda x: severity_order.get(x["severity"], 99))
 
@@ -586,9 +797,16 @@ def format_report(r: AnalysisResult) -> str:
     return "\n".join(lines)
 
 
-# ─── JSON 输出（机器可读） ─────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# JSON 输出（机器可读）
+# ═══════════════════════════════════════════════════════════════
+# 如果你想把结果传给其他程序处理（而不是给人看），可以用 JSON 格式。
 
 def format_json(r: AnalysisResult) -> str:
+    """把分析结果转成 JSON 格式（方便程序读取）。
+
+    JSON 是一种通用的数据交换格式，几乎所有编程语言都能解析。
+    """
     d = {
         "score": r.overall_score,
         "diagnosis": r.diagnosis,
@@ -614,12 +832,43 @@ def format_json(r: AnalysisResult) -> str:
     return json.dumps(d, ensure_ascii=False, indent=2)
 
 
-# ─── Fix 引擎 ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# Fix 引擎 — 一键修复
+# ═══════════════════════════════════════════════════════════════
+# 这个功能专门处理"记忆文件太多"的问题。
+# 它会自动把同类小文件合并成一个大文件，减少固定前缀的大小。
+#
+# 什么是 frontmatter？
+#   记忆文件的开头有 --- 包裹的元数据区域，像这样：
+#   ---
+#   name: user-profile
+#   description: 用户信息
+#   ---
+#   这就是 frontmatter，记录了文件的属性信息。
 
 def parse_frontmatter(text: str) -> tuple[dict, str]:
-    """解析 Markdown frontmatter，返回 (metadata, body)。"""
+    """解析 Markdown 文件开头的 frontmatter 元数据。
+
+    参数：
+      text: 文件的完整内容
+
+    返回值：
+      (metadata, body) 元组
+      - metadata: 元数据字典（如 {"name": "user-profile", "type": "user"}）
+      - body: 去掉 frontmatter 后的正文内容
+
+    例子：
+      输入：
+        ---
+        name: test
+        type: user
+        ---
+        正文内容
+      输出：
+        ({"name": "test", "type": "user"}, "正文内容")
+    """
     if not text.startswith("---"):
-        return {}, text
+        return {}, text  # 没有 frontmatter，全当正文处理
     parts = text.split("---", 2)
     if len(parts) < 3:
         return {}, text
@@ -635,18 +884,26 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
 
 
 def build_merge_plan(memory_dir: str) -> list[dict]:
-    """生成记忆文件合并计划。按 type 分组，小文件优先合并。"""
+    """生成记忆文件的合并计划。
+
+    思路：
+      1. 找出所有记忆文件
+      2. 按 type（类型）分组
+      3. 同一类型的小文件建议合并成一个
+
+    比如 type 为 "user" 的文件 user1.md 和 user2.md → 合并为 user-profile.md
+    """
     mem_path = Path(memory_dir)
     if not mem_path.exists():
         return []
 
     files = []
     for f in sorted(mem_path.glob("*.md")):
-        if f.name == "MEMORY.md":
+        if f.name == "MEMORY.md":  # 索引文件不参与合并
             continue
         text = f.read_text(encoding="utf-8")
         meta, body = parse_frontmatter(text)
-        ftype = meta.get("type", "other")
+        ftype = meta.get("type", "other")  # 没有 type 就归为 "other"
         files.append({
             "name": f.name,
             "path": str(f),
@@ -655,20 +912,20 @@ def build_merge_plan(memory_dir: str) -> list[dict]:
             "body": body,
         })
 
-    # 分组
+    # 按类型分组
     groups = {}
     for f in files:
         g = groups.setdefault(f["type"], [])
         g.append(f)
 
+    # 生成合并计划
     plan = []
     for ftype, members in groups.items():
-        if len(members) <= 1 and members[0]["size"] < 2000:
-            continue  # 单文件且不超 2KB，不动
         if len(members) <= 1:
-            continue
+            continue  # 只有一个文件，不用合并
 
         total_size = sum(m["size"] for m in members)
+        # 不同类型合并后的目标文件名
         target_name = {
             "user": "user-profile.md",
             "feedback": "workflow-rules.md",
@@ -687,7 +944,23 @@ def build_merge_plan(memory_dir: str) -> list[dict]:
 
 
 def apply_fix(memory_dir: str, dry_run: bool = True) -> list[str]:
-    """执行记忆文件合并修复。"""
+    """执行记忆文件合并修复。
+
+    参数：
+      memory_dir: 记忆文件目录路径
+      dry_run: 是否只预览不执行（True = 只看方案，False = 真的合并）
+
+    返回值：
+      操作报告列表，每行一条信息
+
+    dry_run=True 时：
+      只显示合并方案，不修改任何文件
+
+    dry_run=False 时：
+      1. 合并同类文件 → 写入新文件
+      2. 删除被合并的原文件
+      3. 返回操作记录
+    """
     mem_path = Path(memory_dir)
     reports = []
 
@@ -707,9 +980,9 @@ def apply_fix(memory_dir: str, dry_run: bool = True) -> list[str]:
         reports.append(f"    合并后约 {group['total_size']} bytes → 更小固定前缀")
 
         if dry_run:
-            continue
+            continue  # 预览模式，到此为止
 
-        # 备份原文件 + 创建合并文件
+        # ── 执行模式：真的做合并 ──
         merged_parts = []
         merged_frontmatter = {
             "name": group["target"].replace(".md", ""),
@@ -724,17 +997,18 @@ def apply_fix(memory_dir: str, dry_run: bool = True) -> list[str]:
             + "\n---\n\n"
         )
 
+        # 把每个原文件的内容作为二级标题拼进去
         for member in group["members"]:
             original_name = member["name"].replace(".md", "")
             merged_parts.append(f"## {original_name}\n\n{member['body'].strip()}\n")
 
         merged_content = merged_frontmatter_str + "\n\n".join(merged_parts)
 
-        # 写合并文件
+        # 写合并后的文件
         target_path = mem_path / group["target"]
         target_path.write_text(merged_content, encoding="utf-8")
 
-        # 删除原文件
+        # 删除被合并的原文件
         for fname in group["files"]:
             (mem_path / fname).unlink()
 
@@ -749,7 +1023,16 @@ def apply_fix(memory_dir: str, dry_run: bool = True) -> list[str]:
 
 
 def backup_memory(memory_dir: str) -> str:
-    """备份记忆目录到时间戳文件夹。"""
+    """备份记忆目录到带时间戳的文件夹。
+
+    在执行修复前先备份，万一合并错了还能恢复。
+
+    参数：
+      memory_dir: 记忆文件目录
+
+    返回值：
+      备份文件夹的路径
+    """
     mem_path = Path(memory_dir)
     backup_dir = mem_path.parent / f"memory_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -759,10 +1042,24 @@ def backup_memory(memory_dir: str) -> str:
     return str(backup_dir)
 
 
-# ─── 仪表盘 HTML 生成 ──────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# 仪表盘 HTML 生成
+# ═══════════════════════════════════════════════════════════════
+# 生成一个漂亮的网页报告，可以在浏览器里打开看。
 
 def generate_dashboard(result: AnalysisResult) -> str:
-    """生成独立 HTML 仪表盘。"""
+    """生成独立的 HTML 仪表盘网页。
+
+    这个页面是自包含的（所有 CSS 样式都写在页面里），
+    可以直接在浏览器打开，不需要联网。
+
+    包含：
+      - 综合评分（带进度条）
+      - 命中率数据
+      - 节省预估
+      - 配置状态
+      - 优化建议列表
+    """
     score = result.overall_score
     bar_filled = score // 5
     bar_empty = 20 - bar_filled
@@ -772,6 +1069,7 @@ def generate_dashboard(result: AnalysisResult) -> str:
     cost_total = f"${result.total_cost:.4f}" if result.has_ccswitch_data else "N/A"
     savings = f"${result.projected_savings_monthly:.2f}/月" if result.has_ccswitch_data else "N/A"
 
+    # 生成优化建议的 HTML
     recs_html = ""
     sev_color = {"critical": "#dc3545", "warning": "#ffc107", "info": "#0d6efd", "success": "#198754"}
     for i, rec in enumerate(result.recommendations, 1):
@@ -792,6 +1090,7 @@ def generate_dashboard(result: AnalysisResult) -> str:
         </div>"""
 
     cfg = result.config
+    # 完整的 HTML 页面（深色主题，类似 GitHub 风格）
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -885,9 +1184,26 @@ h2 {{ color: #58a6ff; margin: 28px 0 16px; font-size: 18px;
     return html
 
 
-# ─── CLI ─────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# CLI 命令行入口
+# ═══════════════════════════════════════════════════════════════
+# 这就是用户在命令行输入 python -m cache_optimizer 时实际运行的代码。
 
 def main():
+    """主入口函数 — 解析命令行参数，执行对应的操作。
+
+    支持的参数（用 python -m cache_optimizer --help 查看）：
+      --data     <文件>   从文件读取 CCSwitch 数据
+      --config   <目录>   指定 Claude Code 配置目录
+      --target   <数字>   目标命中率（默认 99%）
+      --json              输出 JSON 格式（机器可读）
+      --summary           只分析摘要文本（不是完整表格）
+      --fix     [dry-run|apply]  一键修复记忆文件
+      --dashboard [文件名]  生成 HTML 网页报告
+      --detect            检测电脑上的 AI agent 和 CCSwitch
+      --setup             自动安装配置 CCSwitch
+      --optimize          完整优化流程
+    """
     parser = argparse.ArgumentParser(description="命中缓存99% — 通用 AI agent 缓存诊断与优化工具")
     parser.add_argument("-d", "--data", help="CCSwitch 数据文件（.txt/.csv），或留空从 stdin 粘贴")
     parser.add_argument("-c", "--config", help="Claude Code 配置目录（默认 ~/.claude）")
@@ -905,7 +1221,9 @@ def main():
     # 确定配置目录
     config_dir = args.config or os.path.expanduser("~/.claude")
 
-    # ─── --detect 模式 ─────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════
+    # --detect 模式：检测环境
+    # ═══════════════════════════════════════════════════════════
     if args.detect:
         print("\n=== 命中缓存99% — 环境检测 ===\n")
 
@@ -934,7 +1252,9 @@ def main():
 
         sys.exit(0)
 
-    # ─── --setup 模式 ──────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════
+    # --setup 模式：自动安装配置
+    # ═══════════════════════════════════════════════════════════
     if args.setup:
         print("\n=== 命中缓存99% — 自动安装配置 ===\n")
 
@@ -953,7 +1273,7 @@ def main():
                 print(f"  ❌ CCSwitch 安装失败，跳过 {agent.display}")
                 print(ccsm.__MANUAL_GUIDE__)
                 continue
-            # 配置 agent 代理
+            # 配置 agent 走 CCSwitch 代理
             ccsm.configure_for_agent(agent)
             print(f"  ✅ 已配置 CCSwitch 代理")
             configured += 1
@@ -966,11 +1286,13 @@ def main():
             print("   python -m cache_optimizer --data data.txt")
         sys.exit(0)
 
-    # ─── --optimize 模式 ──────────────────────────────────
+    # ═══════════════════════════════════════════════════════════
+    # --optimize 模式：完整优化流程
+    # ═══════════════════════════════════════════════════════════
     if args.optimize:
         print("\n=== 命中缓存99% — 完整优化流程 ===\n")
 
-        # 步骤1: 检测
+        # 步骤1: 检测电脑上装了哪些 AI agent
         print("步骤1/4: 检测环境...")
         agent_list = agents.detect_all()
         if not agent_list:
@@ -979,7 +1301,7 @@ def main():
         for a in agent_list:
             print(f"  ✅ {a.display}")
 
-        # 步骤2: 安装 CCSwitch
+        # 步骤2: 安装（或确认）CCSwitch
         print("步骤2/4: 确保 CCSwitch 已安装...")
         ccs = ccsm.ensure_ccswitch(auto_install=True)
         if ccs["installed"]:
@@ -990,7 +1312,7 @@ def main():
             print("  或者直接粘贴数据: python -m cache_optimizer")
             sys.exit(0)
 
-        # 步骤3: 获取数据
+        # 步骤3: 从 CCSwitch 获取使用数据
         print("步骤3/4: 从 CCSwitch 获取使用数据...")
         data = ccsm.fetch_data()
         if data and data.get("raw"):
@@ -1000,12 +1322,12 @@ def main():
             print("  [1] 等待 CCSwitch 收集数据后重试")
             print("  [2] 或现在从 CCSwitch 仪表盘导出数据: python -m cache_optimizer --data data.txt")
 
-        # 配置代理
+        # 为每个 agent 配置 CCSwitch 代理
         for agent in agent_list:
             ccsm.configure_for_agent(agent)
             print(f"  ✅ 已为 {agent.display} 配置 CCSwitch 代理")
 
-        # 步骤4: 分析+修复
+        # 步骤4: 分析 + 修复建议
         print("步骤4/4: 扫描配置并优化...")
         config = scan_config(str(agent_list[0].config_dir))
         result = analyze(None, config, args.target)
@@ -1022,9 +1344,11 @@ def main():
         print("后续: 定期运行 --optimize 持续监控")
         sys.exit(0)
 
-    # ─── --fix 模式 ────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════
+    # --fix 模式：一键修复记忆文件
+    # ═══════════════════════════════════════════════════════════
     if args.fix:
-        # 先备份
+        # 先找到记忆文件目录
         memory_base = None
         for proj_dir in Path(config_dir).glob("projects/*/memory"):
             if proj_dir.exists():
@@ -1040,7 +1364,7 @@ def main():
         print(f"模式: {'预览 (dry-run)' if args.fix == 'dry-run' else '执行 (apply)'}")
         print()
 
-        # 先备份（非 dry-run）
+        # 执行模式：先备份，再修复
         backup_path = None
         if args.fix == "apply":
             backup_path = backup_memory(memory_base)
@@ -1051,7 +1375,7 @@ def main():
         for line in reports:
             print(line)
 
-        # 非 dry-run 时更新 MEMORY.md
+        # 执行模式：更新 MEMORY.md 索引
         if args.fix == "apply":
             mem_path = Path(memory_base)
             memory_md = mem_path / "MEMORY.md"
@@ -1071,9 +1395,15 @@ def main():
 
         sys.exit(0)
 
+    # ═══════════════════════════════════════════════════════════
+    # 数据分析模式（默认）
+    # ═══════════════════════════════════════════════════════════
+    # 这是最常用的模式：加载 CCSwitch 数据 → 扫描配置 → 分析 → 输出报告
+
     # 1. 加载 CCSwitch 数据
     ccswitch = None
     if args.data:
+        # 从文件读取
         try:
             with open(args.data, encoding="utf-8") as f:
                 text = f.read()
@@ -1081,16 +1411,18 @@ def main():
             print(f"错误: 无法读取数据文件: {e}")
             sys.exit(1)
     elif not sys.stdin.isatty():
-        # 管道模式（非交互），直接读
+        # 管道模式：直接从上一个命令的输出读取
+        # 比如: ccswitch export | python -m cache_optimizer
         text = sys.stdin.buffer.read().decode("utf-8").strip()
     else:
-        # 交互模式，提示用户粘贴
+        # 交互模式：提示用户粘贴数据
         print("[粘贴 CCSwitch 数据（Tab 分隔的请求日志），Ctrl+D/Ctrl+Z 结束]:")
         try:
             text = sys.stdin.buffer.read().decode("utf-8").strip()
         except (KeyboardInterrupt, EOFError):
             text = ""
 
+    # 解析数据
     if text:
         try:
             if args.summary:
@@ -1115,16 +1447,19 @@ def main():
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(html)
         print(f"✅ 仪表盘已生成: {os.path.abspath(out_path)}")
-        webbrowser.open(os.path.abspath(out_path))
+        webbrowser.open(os.path.abspath(out_path))  # 自动在浏览器打开
         sys.exit(0)
 
-    # 4. 输出
+    # 4. 输出：JSON 或文字报告
     if args.json:
         print(format_json(result))
     else:
         print(format_report(result))
 
     # 5. 退出码
+    # 分数 < 50  → 退出码 2（严重问题）
+    # 分数 < 70  → 退出码 1（有问题）
+    # 分数 >= 70 → 退出码 0（正常）
     if result.overall_score < 50:
         sys.exit(2)
     elif result.overall_score < 70:
