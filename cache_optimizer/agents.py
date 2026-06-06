@@ -274,12 +274,9 @@ def detect_ccswitch() -> dict:
     if sf.exists():
         try:
             settings = json.loads(sf.read_text(encoding="utf-8"))
-            result["config"] = settings
-            # 看看代理端口
+            # 只提取安全字段，不保留原始 settings 全文（防敏感信息泄漏）
             if settings.get("enableLocalProxy"):
-                # 从 proxy_config 表拿端口更准，这里只是 fallback
                 result["proxy_port"] = 15721
-            # 如果有版本字段
             result["version"] = settings.get("version", "桌面版")
         except Exception:
             pass

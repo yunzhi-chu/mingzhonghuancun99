@@ -598,7 +598,7 @@ def _scan_claude_config(claude_dir: Path, result: ConfigScanResult):
                             severity="info",
                             category="settings",
                             title="settings.json 含长 Token 值",
-                            detail=f"{k}={v[:16]}...{v[-4:]}。Token 本身不直接影响命中率，但混淆时可能误认为是动态内容。",
+                            detail=f"{k}={v[:4]}...{v[-4:]}。Token 本身不直接影响命中率，但混淆时可能误认为是动态内容。",
                             impact="无直接影响",
                             fix="确保 token 值不在 CLAUDE.md 或 system prompt 中引用。"
                         ))
@@ -1214,6 +1214,156 @@ def backup_memory(memory_dir: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
+# 交互式自动修复
+# ═══════════════════════════════════════════════════════════════
+# --optimize 完成后，逐条询问用户是否执行修复。
+
+def auto_fix_interactive(result, agent_list):
+    """优化完成后，逐条展示并询问是否自动修复。
+
+    参数：
+      result:      analyze() 返回的 AnalysisResult
+      agent_list:  agents.detect_all() 返回的 agent 列表
+    """
+    if not result.recommendations:
+        return
+
+    severity_order = {"critical": 0, "warning": 1, "info": 2, "success": 3}
+    sorted_recs = sorted(result.recommendations,
+                         key=lambda x: severity_order.get(x["severity"], 99))
+
+    print("\n" + "━" * 50)
+    print("🛠  自动修复推荐")
+    print("━" * 50)
+
+    fixed_count = 0
+    skip_count = 0
+
+    for i, rec in enumerate(sorted_recs, 1):
+        # 判断这个建议能否自动修复
+        fix_action = _get_auto_fix_action(rec, agent_list)
+        if fix_action is None:
+            # 不能自动修复，跳过
+            skip_count += 1
+            continue
+
+        print(f"\n{'─' * 40}")
+        print(f"  建议 #{i}: {rec['title']}")
+        print(f"{'─' * 40}")
+        print(f"  【解释】{rec['detail']}")
+        print(f"  【好处】{rec['impact']}")
+        print(f"  【操作】{fix_action['description']}")
+        if fix_action.get("risk"):
+            print(f"  【风险】{fix_action['risk']}")
+
+        answer = input("\n  是否执行此优化？(y/N): ").strip().lower()
+        if answer not in ("y", "yes"):
+            print(f"  - 已跳过")
+            skip_count += 1
+            continue
+
+        # 执行修复
+        try:
+            fix_action["handler"](fix_action)
+            print(f"  ✅ 修复完成")
+            fixed_count += 1
+        except Exception as e:
+            print(f"  ❌ 修复失败: {e}")
+
+    print(f"\n{'─' * 40}")
+    if fixed_count > 0:
+        print(f"✅ 已执行 {fixed_count} 项优化")
+    if skip_count > 0:
+        print(f"⏭️  跳过 {skip_count} 项（需手动处理或已跳过）")
+    if fixed_count == 0 and skip_count > 0:
+        print("💡 运行 --fix dry-run 查看记忆文件合并方案")
+
+
+def _get_auto_fix_action(rec, agent_list):
+    """判断一条建议能否自动修复，返回动作描述或 None。"""
+    cat = rec.get("category", "")
+    title = rec.get("title", "")
+
+    # ── 记忆文件合并 ──
+    if "memory" in cat and "过多" in title:
+        # 找 Claude 的记忆目录
+        memory_dirs = []
+        for agent in agent_list:
+            if agent.name == "claude" and agent.config_dir.exists():
+                for proj_dir in agent.config_dir.glob("projects/*/memory"):
+                    if proj_dir.exists():
+                        memory_dirs.append(str(proj_dir))
+        if not memory_dirs:
+            return None
+
+        def _do_merge(action):
+            for md in action["memory_dirs"]:
+                print(f"    处理: {md}")
+                backup = backup_memory(md)
+                print(f"    备份: {backup}")
+                reports = apply_fix(md, dry_run=False)
+                for r in reports:
+                    print(f"    {r}")
+
+        return {
+            "description": "按类型合并同类记忆文件（自动备份，可回滚）",
+            "risk": "合并后原文件被删除，但已备份到同级目录",
+            "handler": _do_merge,
+            "memory_dirs": memory_dirs,
+        }
+
+    # ── 移除 CLAUDE.md / AGENTS.md 中的动态日期/时间 ──
+    if "claude_md" in cat and "动态" in title:
+        # 找到要修复的文件
+        targets = []
+        for agent in agent_list:
+            if agent.name == "claude":
+                f = agent.config_dir / "CLAUDE.md"
+                if f.exists():
+                    targets.append(("Claude Code", str(f)))
+            elif agent.name == "codex":
+                f = agent.config_dir / "AGENTS.md"
+                if f.exists():
+                    targets.append(("Codex CLI", str(f)))
+
+        if not targets:
+            return None
+
+        def _strip_dynamic(action):
+            for display, path in action["targets"]:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                # 备份
+                backup_path = path + ".bak"
+                with open(backup_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                # 移除日期模式
+                import re as _re
+                new_content = _re.sub(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", "[日期]", content)
+                # 移除时间模式
+                new_content = _re.sub(r"(?<!\d)\d{2}:\d{2}(?!\d)", "[时间]", new_content)
+                # 移除中文相对日期
+                new_content = _re.sub(r"今天|昨天|明天|星期[一二三四五六日]", "[相对日期]", new_content)
+                # 只在实际有变化时才写
+                if new_content != content:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(new_content)
+                    print(f"    {display}: 已移除动态内容（备份: {backup_path}）")
+                else:
+                    print(f"    {display}: 未发现可自动移除的动态内容")
+
+        return {
+            "description": "自动检测并替换 CLAUDE.md / AGENTS.md 中的日期、时间等动态内容为固定占位符",
+            "risk": "如果日期是手动维护的，替换后需手动还原；原始文件已备份为 .bak",
+            "handler": _strip_dynamic,
+            "targets": targets,
+            "rec": rec,
+        }
+
+    return None  # 不能自动修复
+
+
+# ═══════════════════════════════════════════════════════════════
 # 仪表盘 HTML 生成
 # ═══════════════════════════════════════════════════════════════
 # 生成一个漂亮的网页报告，可以在浏览器里打开看。
@@ -1286,11 +1436,13 @@ def generate_dashboard(result: AnalysisResult) -> str:
                 </div>
             </details>"""
 
-    # 记忆文件列表
+    # 记忆文件列表（HTML 转义文件名防注入）
     mem_list_html = ""
     if cfg.memory_file_list:
+        _escape_table = str.maketrans({"<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;"})
         for name, size in sorted(cfg.memory_file_list, key=lambda x: -x[1])[:5]:
-            mem_list_html += f"<div class='mem-item'><span class='mem-name'>{name}</span><span class='mem-size'>{size:,} B</span></div>"
+            safe_name = name.translate(_escape_table)
+            mem_list_html += f"<div class='mem-item'><span class='mem-name'>{safe_name}</span><span class='mem-size'>{size:,} B</span></div>"
 
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1647,7 +1799,7 @@ def main():
         for key in env_keys:
             val = os.environ.get(key, "")
             if val:
-                masked = val[:8] + "..." + val[-4:] if len(val) > 16 else val[:4] + "..."
+                masked = val[:4] + "..." + val[-4:] if len(val) > 16 else val[:2] + "..."
                 print(f"  ✅ {key}={masked}")
                 found_any = True
         if not found_any:
@@ -1747,10 +1899,15 @@ def main():
         if result.overall_score >= 95:
             print(f"  ✅ 当前缓存健康度 {result.overall_score}/100，无需优化")
         else:
-            print(f"  📋 建议 {len(result.recommendations)} 项优化")
-            print(f"  运行 --fix dry-run 查看详情")
+            print(f"  📋 发现 {len(result.recommendations)} 项可优化内容")
         print()
         print(format_report(result))
+
+        # 推荐修复交互
+        if not sys.stdin.isatty():
+            print("\n(管道模式，跳过交互修复)")
+        else:
+            auto_fix_interactive(result, agent_list)
 
         print("━" * 50)
         print("优化流程完成！")
