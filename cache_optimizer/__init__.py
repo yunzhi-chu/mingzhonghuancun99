@@ -358,144 +358,6 @@ def scan_config(base_dir: str = None) -> ConfigScanResult:
     return result
 
 
-def scan_codex_config() -> ConfigScanResult:
-    """扫描 Codex CLI 的配置目录，找出影响缓存的问题。
-
-    Codex CLI 的配置在 ~/.codex/，与 Claude Code 结构不同：
-      - AGENTS.md ← 系统提示（等效于 CLAUDE.md）
-      - config.toml ← 配置文件
-      - memories/  ← 记忆文件
-      - logs_2.sqlite ← 日志（太大，不扫描）
-    """
-    codex_dir = Path.home() / ".codex"
-    if not codex_dir.exists():
-        return ConfigScanResult()
-
-    result = ConfigScanResult()
-
-    # ── 检查 AGENTS.md（系统提示）───────────────────────────
-    # 只检查文件大小，不检查动态内容（用户指定不需要）
-    ag = codex_dir / "AGENTS.md"
-    if ag.exists():
-        content = ag.read_text(encoding="utf-8")
-        result.claude_md_size = len(content.encode("utf-8"))
-        result.claude_md_lines = content.count("\n") + 1
-
-        if result.claude_md_size > 2048:
-            result.issues.append(ConfigIssue(
-                severity="info",
-                category="claude_md",
-                title=f"AGENTS.md 体积较大 ({result.claude_md_size} bytes, Codex)",
-                detail="大于 2KB 的 AGENTS.md 会占用固定前缀空间，增大每轮总输入。",
-                impact="每增大 1KB 固定前缀，约增加 $0.0001/请求的成本基数",
-                fix="精简 AGENTS.md 至 1-2KB 以内，非核心内容放入记忆文件夹按需加载。"
-            ))
-
-    # ── 检查 memories/ 目录（记忆文件）──────────────────────
-    mem_dir = codex_dir / "memories"
-    if mem_dir.exists():
-        for f in mem_dir.iterdir():
-            if f.suffix == ".md":
-                fsize = f.stat().st_size
-                result.memory_file_count += 1
-                result.memory_total_size += fsize
-                result.memory_file_list.append((f.name, fsize))
-        if result.memory_file_count > 10:
-            result.issues.append(ConfigIssue(
-                severity="warning",
-                category="memory",
-                title=f"Codex 记忆文件过多 ({result.memory_file_count} 个)",
-                detail=f"共 {result.memory_file_count} 个记忆文件，总计 {result.memory_total_size} bytes。",
-                impact="每多 10 个文件，system prompt 开销增加 ~500 tokens",
-                fix="合并同类记忆文件至 5 个以内。"
-            ))
-        if result.memory_total_size > 10000:
-            result.issues.append(ConfigIssue(
-                severity="info",
-                category="memory",
-                title=f"Codex 记忆目录总大小 {result.memory_total_size} bytes",
-                detail="记忆文件全量加载到固定前缀中。过大会推高每次请求的基础 token 消耗。",
-                impact=f"约占总固定前缀的 {result.memory_total_size // 4} tokens",
-                fix="定期清理过期记忆，合并冗余条目。"
-            ))
-
-    # ── 检查 config.toml（MCP 服务和插件）─────────────────
-    ct = codex_dir / "config.toml"
-    if ct.exists():
-        try:
-            text = ct.read_text(encoding="utf-8")
-            # MCP server 数量
-            mcp_count = text.count("[mcp_servers.")
-            if mcp_count > 0:
-                result.mcp_count = mcp_count
-            # plugins 数量
-            plugin_count = text.count("[plugins.")
-            result.skill_count = max(result.skill_count, plugin_count)
-            # 检查 enabledPlugins / 多余配置
-        except Exception:
-            pass
-
-    # ── 检查历史文件大小 ────────────────────────────────────
-    hist = codex_dir / "history.jsonl"
-    if hist.exists():
-        result.history_size_mb = hist.stat().st_size / (1024 * 1024)
-
-    # 加个来源标记
-    for issue in result.issues:
-        if "Codex" not in issue.category:
-            issue.category = f"codex_{issue.category}"
-
-    return result
-
-
-def scan_all_configs(agent_list: list = None) -> ConfigScanResult:
-    """扫描所有已检测到的 AI agent 的配置。
-
-    依次扫描每个 agent 的配置目录，合并扫描结果。
-    目前支持 Claude Code 和 Codex CLI。
-
-    参数：
-      agent_list: detect_all() 返回的 agent 列表
-
-    返回值：
-      合并后的 ConfigScanResult
-    """
-    merged = ConfigScanResult()
-
-    if agent_list is None:
-        from . import agents
-        agent_list = agents.detect_all()
-
-    for agent in agent_list:
-        if agent.name == "claude" and agent.config_dir.exists():
-            claude_result = ConfigScanResult()
-            try:
-                _scan_claude_config(agent.config_dir, claude_result)
-                _merge_config_result(merged, claude_result, "claude")
-            except Exception:
-                pass
-        elif agent.name == "codex" and agent.config_dir.exists():
-            codex_result = scan_codex_config()
-            _merge_config_result(merged, codex_result, "codex")
-
-    return merged
-
-
-def _merge_config_result(target: ConfigScanResult, source: ConfigScanResult, prefix: str):
-    """把 source 的扫描结果合并到 target 中。"""
-    target.claude_md_size += source.claude_md_size
-    target.claude_md_lines += source.claude_md_lines
-    target.claude_md_has_dynamic = target.claude_md_has_dynamic or source.claude_md_has_dynamic
-    target.memory_file_count += source.memory_file_count
-    target.memory_total_size += source.memory_total_size
-    target.memory_file_list.extend(source.memory_file_list)
-    target.skill_count += source.skill_count
-    target.mcp_count += source.mcp_count
-    target.settings_issues.extend(source.settings_issues)
-    target.history_size_mb += source.history_size_mb
-    target.issues.extend(source.issues)
-
-
 def _scan_claude_config(claude_dir: Path, result: ConfigScanResult):
     """扫描单个 Claude Code 配置目录。结果写入 result 对象。"""
     # ── 检查 CLAUDE.md ──────────────────────────────────────
@@ -1257,7 +1119,7 @@ def auto_fix_interactive(result, agent_list):
     if skip_count > 0:
         print(f"⏭️  跳过 {skip_count} 项（需手动处理或已跳过）")
     if fixed_count == 0 and skip_count > 0:
-        print("💡 运行 --fix dry-run 查看记忆文件合并方案")
+        print("💡 运行 --fix dry-run 查看记忆文件合并详情")
 
 
 def _get_auto_fix_action(rec, agent_list):
@@ -1293,19 +1155,15 @@ def _get_auto_fix_action(rec, agent_list):
             "memory_dirs": memory_dirs,
         }
 
-    # ── 移除 CLAUDE.md / AGENTS.md 中的动态日期/时间 ──
+    # ── 移除 CLAUDE.md 中的动态日期/时间 ──
     if "claude_md" in cat and "动态" in title:
-        # 找到要修复的文件
+        # 找 Claude 的 CLAUDE.md
         targets = []
         for agent in agent_list:
             if agent.name == "claude":
                 f = agent.config_dir / "CLAUDE.md"
                 if f.exists():
                     targets.append(("Claude Code", str(f)))
-            elif agent.name == "codex":
-                f = agent.config_dir / "AGENTS.md"
-                if f.exists():
-                    targets.append(("Codex CLI", str(f)))
 
         if not targets:
             return None
@@ -1875,7 +1733,7 @@ def main():
 
         # 步骤4: 分析 + 修复建议
         print("步骤4/4: 扫描配置并优化...")
-        config = scan_all_configs(agent_list)
+        config = scan_config(str(agent_list[0].config_dir))
         result = analyze(ccswitch_data, config, args.target)
         if result.overall_score >= 95:
             print(f"  ✅ 当前缓存健康度 {result.overall_score}/100，无需优化")
@@ -1985,8 +1843,8 @@ def main():
             print("提示: 数据应为 CCSwitch 导出的 Tab 分隔格式")
             sys.exit(1)
 
-    # 2. 扫描配置（自动检测所有 agent）
-    config = scan_all_configs()
+    # 2. 扫描配置
+    config = scan_config(args.config)
 
     # 3. 分析
     result = analyze(ccswitch, config, args.target)
