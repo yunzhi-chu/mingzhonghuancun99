@@ -332,30 +332,70 @@ class ConfigScanResult:
     settings_issues: list = field(default_factory=list)
     history_size_mb: float = 0.0
     issues: list[ConfigIssue] = field(default_factory=list)
+    agents_scanned: list[str] = field(default_factory=list)  # 哪些 agent 被扫描了
 
 
 def scan_config(base_dir: str = None) -> ConfigScanResult:
-    """扫描 Claude Code 的配置目录，找出影响缓存的问题。
-
-    参数：
-      base_dir: Claude Code 的配置目录（默认 ~/.claude）
-
-    扫描内容：
-      1. CLAUDE.md — 系统提示文件
-      2. 记忆文件目录 — 存储在 projects/*/memory/ 下的 .md 文件
-      3. settings.json — 配置文件
-      4. MCP 服务配置
-      5. 对话历史文件大小
-    """
+    """扫描单个 Claude Code 配置目录（向后兼容）。"""
     if base_dir is None:
-        base_dir = os.path.expanduser("~/.claude")  # 默认路径
+        base_dir = os.path.expanduser("~/.claude")
     claude_dir = Path(base_dir)
     if not claude_dir.exists():
-        return ConfigScanResult()  # 目录不存在，返回空结果
-
+        return ConfigScanResult()
     result = ConfigScanResult()
+    result.agents_scanned.append("claude")
     _scan_claude_config(claude_dir, result)
     return result
+
+
+def scan_all_configs(agent_list: list = None) -> ConfigScanResult:
+    """扫描所有已检测到的 AI agent 的配置。
+
+    自动适配每个 agent 的配置文件结构。
+    """
+    merged = ConfigScanResult()
+
+    if agent_list is None:
+        from . import agents as _ag
+        agent_list = _ag.detect_all()
+
+    for agent in agent_list:
+        name = agent.name
+        cfg_dir = agent.config_dir
+        if not cfg_dir.exists():
+            continue
+
+        if name == "claude":
+            single = ConfigScanResult()
+            single.agents_scanned.append("claude")
+            _scan_claude_config(cfg_dir, single)
+            _merge_into(merged, single)
+
+        elif name == "codex":
+            single = ConfigScanResult()
+            single.agents_scanned.append("codex")
+            _scan_codex_config(cfg_dir, single)
+            _merge_into(merged, single)
+
+        elif name == "hermes":
+            single = ConfigScanResult()
+            single.agents_scanned.append("hermes")
+            _scan_hermes_config(cfg_dir, single)
+            _merge_into(merged, single)
+
+    return merged
+
+
+def _merge_into(target: ConfigScanResult, source: ConfigScanResult):
+    """合并两个扫描结果。"""
+    for attr in ["claude_md_size", "claude_md_lines", "memory_file_count",
+                  "memory_total_size", "skill_count", "mcp_count", "history_size_mb"]:
+        setattr(target, attr, getattr(target, attr) + getattr(source, attr))
+    target.claude_md_has_dynamic = target.claude_md_has_dynamic or source.claude_md_has_dynamic
+    target.memory_file_list.extend(source.memory_file_list)
+    target.settings_issues.extend(source.settings_issues)
+    target.issues.extend(source.issues)
+    target.agents_scanned.extend(source.agents_scanned)
 
 
 def _scan_claude_config(claude_dir: Path, result: ConfigScanResult):
@@ -472,6 +512,78 @@ def _scan_claude_config(claude_dir: Path, result: ConfigScanResult):
     hist = claude_dir / "history.jsonl"
     if hist.exists():
         result.history_size_mb = hist.stat().st_size / (1024 * 1024)
+
+
+def _scan_codex_config(codex_dir: Path, result: ConfigScanResult):
+    """扫描 Codex CLI 配置目录。
+
+    扫描项：AGENTS.md 体积、memories/ 文件、config.toml MCP/插件。
+    """
+    # ── AGENTS.md 体积（不检查动态内容）──────────────────────
+    ag = codex_dir / "AGENTS.md"
+    if ag.exists():
+        content = ag.read_text(encoding="utf-8")
+        result.claude_md_size += len(content.encode("utf-8"))
+        result.claude_md_lines += content.count("\n") + 1
+
+    # ── memories/ 记忆文件 ───────────────────────────────────
+    mem_dir = codex_dir / "memories"
+    if mem_dir.exists():
+        for f in mem_dir.iterdir():
+            if f.suffix == ".md":
+                sz = f.stat().st_size
+                result.memory_file_count += 1
+                result.memory_total_size += sz
+                result.memory_file_list.append((f.name, sz))
+
+    # ── config.toml MCP 服务数 ───────────────────────────────
+    ct = codex_dir / "config.toml"
+    if ct.exists():
+        try:
+            text = ct.read_text(encoding="utf-8")
+            result.mcp_count += text.count("[mcp_servers.")
+            result.skill_count += text.count("[plugins.")
+        except Exception:
+            pass
+
+    # ── 历史文件大小 ────────────────────────────────────────
+    hist = codex_dir / "history.jsonl"
+    if hist.exists():
+        result.history_size_mb += hist.stat().st_size / (1024 * 1024)
+
+
+def _scan_hermes_config(hermes_dir: Path, result: ConfigScanResult):
+    """扫描 Hermes Agent 配置目录。
+
+    Hermes 用 config.yaml 配置，skills/ 目录存技能。
+    """
+    # ── config.yaml 体积 ─────────────────────────────────────
+    cy = hermes_dir / "config.yaml"
+    if cy.exists():
+        content = cy.read_text(encoding="utf-8")
+        result.claude_md_size += len(content.encode("utf-8"))
+        result.claude_md_lines += content.count("\n") + 1
+        # 检测是否有 MCP 配置
+        import re as _re
+        mcp_matches = _re.findall(r"mcp_servers\s*:", content)
+        if mcp_matches:
+            result.mcp_count += len(mcp_matches)
+
+    # ── skills/ 技能目录 ────────────────────────────────────
+    sk = hermes_dir / "skills"
+    if sk.exists():
+        skill_count = len([f for f in sk.iterdir() if f.is_dir() or f.suffix == ".md"])
+        result.skill_count += max(1, skill_count)  # 至少有目录本身
+
+    # ── ccr/ 记忆/缓存目录 ─────────────────────────────────
+    ccr = hermes_dir / "ccr"
+    if ccr.exists():
+        for f in ccr.iterdir():
+            if f.is_file():
+                sz = f.stat().st_size
+                result.memory_file_count += 1
+                result.memory_total_size += sz
+                result.memory_file_list.append((f.name, sz))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -753,7 +865,9 @@ def format_report(r: AnalysisResult) -> str:
     lines.append("三、配置诊断")
     lines.append("━" * 50)
     cfg = r.config
-    lines.append(f"  CLAUDE.md:      {cfg.claude_md_size} bytes, {cfg.claude_md_lines} 行{' ⚠️ 含动态内容' if cfg.claude_md_has_dynamic else ''}")
+    agents_str = ", ".join(cfg.agents_scanned) if cfg.agents_scanned else "claude"
+    lines.append(f"  已检测 Agent:  {agents_str}")
+    lines.append(f"  系统提示:      {cfg.claude_md_size} bytes, {cfg.claude_md_lines} 行{' ⚠️ 含动态内容' if cfg.claude_md_has_dynamic else ''}")
     lines.append(f"  记忆文件:       {cfg.memory_file_count} 个, 共 {cfg.memory_total_size} bytes")
     if cfg.memory_file_list:
         for name, size in sorted(cfg.memory_file_list, key=lambda x: -x[1])[:5]:
@@ -813,6 +927,7 @@ def format_json(r: AnalysisResult) -> str:
             "savings_percent": round(r.projected_savings_percent, 1) if r.has_ccswitch_data else None,
         },
         "config": {
+            "agents_scanned": r.config.agents_scanned,
             "claude_md_size": r.config.claude_md_size,
             "claude_md_has_dynamic": r.config.claude_md_has_dynamic,
             "memory_file_count": r.config.memory_file_count,
@@ -1537,6 +1652,10 @@ body {{
         <div class="card-title">配置状态</div>
         <div class="config-grid">
             <div class="config-item">
+                <span class="config-key">已扫描 Agent</span>
+                <span class="config-value">{', '.join(cfg.agents_scanned) if cfg.agents_scanned else 'claude'}</span>
+            </div>
+            <div class="config-item">
                 <span class="config-key">系统提示</span>
                 <span class="config-value">{cfg.claude_md_size:,} bytes, {cfg.claude_md_lines} 行{' <span class="config-value dynamic">⚠️ 含动态内容</span>' if cfg.claude_md_has_dynamic else ''}</span>
             </div>
@@ -1733,7 +1852,7 @@ def main():
 
         # 步骤4: 分析 + 修复建议
         print("步骤4/4: 扫描配置并优化...")
-        config = scan_config(str(agent_list[0].config_dir))
+        config = scan_all_configs(agent_list)
         result = analyze(ccswitch_data, config, args.target)
         if result.overall_score >= 95:
             print(f"  ✅ 当前缓存健康度 {result.overall_score}/100，无需优化")
@@ -1843,8 +1962,8 @@ def main():
             print("提示: 数据应为 CCSwitch 导出的 Tab 分隔格式")
             sys.exit(1)
 
-    # 2. 扫描配置
-    config = scan_config(args.config)
+    # 2. 扫描配置（自适应所有 agent）
+    config = scan_all_configs()
 
     # 3. 分析
     result = analyze(ccswitch, config, args.target)
