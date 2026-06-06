@@ -354,23 +354,181 @@ def scan_config(base_dir: str = None) -> ConfigScanResult:
         return ConfigScanResult()  # 目录不存在，返回空结果
 
     result = ConfigScanResult()
+    _scan_claude_config(claude_dir, result)
+    return result
 
+
+def scan_codex_config() -> ConfigScanResult:
+    """扫描 Codex CLI 的配置目录，找出影响缓存的问题。
+
+    Codex CLI 的配置在 ~/.codex/，与 Claude Code 结构不同：
+      - AGENTS.md ← 系统提示（等效于 CLAUDE.md）
+      - config.toml ← 配置文件
+      - memories/  ← 记忆文件
+      - logs_2.sqlite ← 日志（太大，不扫描）
+    """
+    codex_dir = Path.home() / ".codex"
+    if not codex_dir.exists():
+        return ConfigScanResult()
+
+    result = ConfigScanResult()
+
+    # ── 检查 AGENTS.md（系统提示）───────────────────────────
+    ag = codex_dir / "AGENTS.md"
+    if ag.exists():
+        content = ag.read_text(encoding="utf-8")
+        result.claude_md_size = len(content.encode("utf-8"))
+        result.claude_md_lines = content.count("\n") + 1
+
+        dynamic_patterns = [
+            (r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", "日期"),
+            (r"\d{2}:\d{2}", "时间"),
+            (r"今天|昨天|明天|星期[一二三四五六日]", "相对日期"),
+            ("CURRENT_DATE|currentDate|{{.*}}", "模板变量"),
+        ]
+        dynamic_items = []
+        for pat, name in dynamic_patterns:
+            if re.search(pat, content):
+                dynamic_items.append(name)
+        result.claude_md_has_dynamic = len(dynamic_items) > 0
+        if dynamic_items:
+            result.issues.append(ConfigIssue(
+                severity="warning",
+                category="claude_md",
+                title="AGENTS.md 含动态内容（Codex）",
+                detail=f"检测到: {', '.join(dynamic_items)}。动态内容使每次请求的前缀发生变化，导致 cache miss。",
+                impact="每次 CI/build 类操作都产生新前缀，命中率损失约 0.1-0.5%",
+                fix="将动态内容移至运行时变量或独立记忆文件。"
+            ))
+        if result.claude_md_size > 2048:
+            result.issues.append(ConfigIssue(
+                severity="info",
+                category="claude_md",
+                title=f"AGENTS.md 体积较大 ({result.claude_md_size} bytes, Codex)",
+                detail="大于 2KB 的 AGENTS.md 会占用固定前缀空间，增大每轮总输入。",
+                impact="每增大 1KB 固定前缀，约增加 $0.0001/请求的成本基数",
+                fix="精简 AGENTS.md 至 1-2KB 以内，非核心内容放入记忆文件夹按需加载。"
+            ))
+
+    # ── 检查 memories/ 目录（记忆文件）──────────────────────
+    mem_dir = codex_dir / "memories"
+    if mem_dir.exists():
+        for f in mem_dir.iterdir():
+            if f.suffix == ".md":
+                fsize = f.stat().st_size
+                result.memory_file_count += 1
+                result.memory_total_size += fsize
+                result.memory_file_list.append((f.name, fsize))
+        if result.memory_file_count > 10:
+            result.issues.append(ConfigIssue(
+                severity="warning",
+                category="memory",
+                title=f"Codex 记忆文件过多 ({result.memory_file_count} 个)",
+                detail=f"共 {result.memory_file_count} 个记忆文件，总计 {result.memory_total_size} bytes。",
+                impact="每多 10 个文件，system prompt 开销增加 ~500 tokens",
+                fix="合并同类记忆文件至 5 个以内。"
+            ))
+        if result.memory_total_size > 10000:
+            result.issues.append(ConfigIssue(
+                severity="info",
+                category="memory",
+                title=f"Codex 记忆目录总大小 {result.memory_total_size} bytes",
+                detail="记忆文件全量加载到固定前缀中。过大会推高每次请求的基础 token 消耗。",
+                impact=f"约占总固定前缀的 {result.memory_total_size // 4} tokens",
+                fix="定期清理过期记忆，合并冗余条目。"
+            ))
+
+    # ── 检查 config.toml（MCP 服务和插件）─────────────────
+    ct = codex_dir / "config.toml"
+    if ct.exists():
+        try:
+            text = ct.read_text(encoding="utf-8")
+            # MCP server 数量
+            mcp_count = text.count("[mcp_servers.")
+            if mcp_count > 0:
+                result.mcp_count = mcp_count
+            # plugins 数量
+            plugin_count = text.count("[plugins.")
+            result.skill_count = max(result.skill_count, plugin_count)
+            # 检查 enabledPlugins / 多余配置
+        except Exception:
+            pass
+
+    # ── 检查历史文件大小 ────────────────────────────────────
+    hist = codex_dir / "history.jsonl"
+    if hist.exists():
+        result.history_size_mb = hist.stat().st_size / (1024 * 1024)
+
+    # 加个来源标记
+    for issue in result.issues:
+        if "Codex" not in issue.category:
+            issue.category = f"codex_{issue.category}"
+
+    return result
+
+
+def scan_all_configs(agent_list: list = None) -> ConfigScanResult:
+    """扫描所有已检测到的 AI agent 的配置。
+
+    依次扫描每个 agent 的配置目录，合并扫描结果。
+    目前支持 Claude Code 和 Codex CLI。
+
+    参数：
+      agent_list: detect_all() 返回的 agent 列表
+
+    返回值：
+      合并后的 ConfigScanResult
+    """
+    merged = ConfigScanResult()
+
+    if agent_list is None:
+        from . import agents
+        agent_list = agents.detect_all()
+
+    for agent in agent_list:
+        if agent.name == "claude" and agent.config_dir.exists():
+            claude_result = ConfigScanResult()
+            try:
+                _scan_claude_config(agent.config_dir, claude_result)
+                _merge_config_result(merged, claude_result, "claude")
+            except Exception:
+                pass
+        elif agent.name == "codex" and agent.config_dir.exists():
+            codex_result = scan_codex_config()
+            _merge_config_result(merged, codex_result, "codex")
+
+    return merged
+
+
+def _merge_config_result(target: ConfigScanResult, source: ConfigScanResult, prefix: str):
+    """把 source 的扫描结果合并到 target 中。"""
+    target.claude_md_size += source.claude_md_size
+    target.claude_md_lines += source.claude_md_lines
+    target.claude_md_has_dynamic = target.claude_md_has_dynamic or source.claude_md_has_dynamic
+    target.memory_file_count += source.memory_file_count
+    target.memory_total_size += source.memory_total_size
+    target.memory_file_list.extend(source.memory_file_list)
+    target.skill_count += source.skill_count
+    target.mcp_count += source.mcp_count
+    target.settings_issues.extend(source.settings_issues)
+    target.history_size_mb += source.history_size_mb
+    target.issues.extend(source.issues)
+
+
+def _scan_claude_config(claude_dir: Path, result: ConfigScanResult):
+    """扫描单个 Claude Code 配置目录。结果写入 result 对象。"""
     # ── 检查 CLAUDE.md ──────────────────────────────────────
-    # CLAUDE.md 是每次请求都会发送的"系统提示"。
-    # 如果它包含日期、时间等动态内容，那每次请求的前缀都不一样，
-    # 缓存就没法命中。
     cm = claude_dir / "CLAUDE.md"
     if cm.exists():
         content = cm.read_text(encoding="utf-8")
         result.claude_md_size = len(content.encode("utf-8"))
         result.claude_md_lines = content.count("\n") + 1
 
-        # 检测动态内容：日期、时间、模板变量等
         dynamic_patterns = [
-            (r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", "日期"),     # 如 2026-06-06
-            (r"\d{2}:\d{2}", "时间"),                        # 如 14:30
-            (r"今天|昨天|明天|星期[一二三四五六日]", "相对日期"),  # 中文相对日期
-            ("CURRENT_DATE|currentDate|{{.*}}", "模板变量"),    # 模板语法
+            (r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", "日期"),
+            (r"\d{2}:\d{2}", "时间"),
+            (r"今天|昨天|明天|星期[一二三四五六日]", "相对日期"),
+            ("CURRENT_DATE|currentDate|{{.*}}", "模板变量"),
         ]
         dynamic_items = []
         for pat, name in dynamic_patterns:
@@ -383,11 +541,9 @@ def scan_config(base_dir: str = None) -> ConfigScanResult:
                 category="claude_md",
                 title="CLAUDE.md 含动态内容",
                 detail=f"检测到: {', '.join(dynamic_items)}。动态内容使每次请求的前缀发生变化，导致 cache miss。",
-                impact=f"每次 CI/build 类操作都产生新前缀，命中率损失约 0.1-0.5%",
+                impact="每次 CI/build 类操作都产生新前缀，命中率损失约 0.1-0.5%",
                 fix="将动态内容移至运行时变量或 system-reminder 区域（该区域不在缓存 key 中）。"
             ))
-
-        # 检查文件大小：太大的 CLAUDE.md 也会增加每次请求的负担
         if result.claude_md_size > 2048:
             result.issues.append(ConfigIssue(
                 severity="info",
@@ -399,8 +555,6 @@ def scan_config(base_dir: str = None) -> ConfigScanResult:
             ))
 
     # ── 检查记忆文件 ────────────────────────────────────────
-    # 记忆文件也是每次请求都会发送的。
-    # 文件越多、越大，固定前缀就越大。
     memory_base = claude_dir / "projects"
     if memory_base.exists():
         for proj_dir in memory_base.iterdir():
@@ -436,7 +590,6 @@ def scan_config(base_dir: str = None) -> ConfigScanResult:
     if sf.exists():
         try:
             s = json.loads(sf.read_text(encoding="utf-8"))
-            # 检查 env 中是否有 token/key 等敏感信息
             env = s.get("env", {})
             for k, v in env.items():
                 if "token" in k.lower() or "key" in k.lower() or "secret" in k.lower():
@@ -449,7 +602,6 @@ def scan_config(base_dir: str = None) -> ConfigScanResult:
                             impact="无直接影响",
                             fix="确保 token 值不在 CLAUDE.md 或 system prompt 中引用。"
                         ))
-            # 检查启用的插件数量
             plugins = s.get("enabledPlugins", {})
             result.skill_count = len(plugins)
             if result.skill_count > 10:
@@ -462,7 +614,7 @@ def scan_config(base_dir: str = None) -> ConfigScanResult:
                     fix="只启用当前项目必需的技能，其余按需启用。"
                 ))
         except (json.JSONDecodeError, KeyError):
-            pass  # 配置文件有问题，忽略
+            pass
 
     # ── 检查 MCP 服务配置 ───────────────────────────────────
     mcp = claude_dir / "mcp.json"
@@ -477,8 +629,6 @@ def scan_config(base_dir: str = None) -> ConfigScanResult:
     hist = claude_dir / "history.jsonl"
     if hist.exists():
         result.history_size_mb = hist.stat().st_size / (1024 * 1024)
-
-    return result
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -957,9 +1107,10 @@ def apply_fix(memory_dir: str, dry_run: bool = True) -> list[str]:
       只显示合并方案，不修改任何文件
 
     dry_run=False 时：
-      1. 合并同类文件 → 写入新文件
-      2. 删除被合并的原文件
-      3. 返回操作记录
+      1. 先写入合并文件（新文件）
+      2. 全部写入成功后再删除旧文件
+      3. 如果任一**写入**失败 → 回滚（删除已写入的合并文件）
+      4. 如果**删除**失败 → 数据不丢，但残留旧文件
     """
     mem_path = Path(memory_dir)
     reports = []
@@ -982,7 +1133,11 @@ def apply_fix(memory_dir: str, dry_run: bool = True) -> list[str]:
         if dry_run:
             continue  # 预览模式，到此为止
 
-        # ── 执行模式：真的做合并 ──
+        # ── 执行模式：事务保护 ──
+        # 原则：先写新文件，全部写完再删旧文件
+        # 写入失败 → 删除已写新文件，回滚
+        # 删除失败 → 残留旧文件，数据不丢
+
         merged_parts = []
         merged_frontmatter = {
             "name": group["target"].replace(".md", ""),
@@ -997,22 +1152,38 @@ def apply_fix(memory_dir: str, dry_run: bool = True) -> list[str]:
             + "\n---\n\n"
         )
 
-        # 把每个原文件的内容作为二级标题拼进去
         for member in group["members"]:
             original_name = member["name"].replace(".md", "")
             merged_parts.append(f"## {original_name}\n\n{member['body'].strip()}\n")
 
         merged_content = merged_frontmatter_str + "\n\n".join(merged_parts)
 
-        # 写合并后的文件
         target_path = mem_path / group["target"]
-        target_path.write_text(merged_content, encoding="utf-8")
+        written_files = []
 
-        # 删除被合并的原文件
-        for fname in group["files"]:
-            (mem_path / fname).unlink()
+        try:
+            # 第一步：写合并文件
+            target_path.write_text(merged_content, encoding="utf-8")
+            written_files.append(target_path)
 
-        reports.append(f"    ✅ 已合并 → {group['target']}")
+            # 第二步：全部写入成功后，删除旧文件
+            for fname in group["files"]:
+                old_file = mem_path / fname
+                if old_file.exists():
+                    old_file.unlink()
+
+            reports.append(f"    ✅ 已合并 → {group['target']}")
+
+        except Exception as e:
+            # 写入或删除失败 → 回滚
+            for wf in written_files:
+                try:
+                    if wf.exists():
+                        wf.unlink()
+                except Exception:
+                    pass
+            reports.append(f"    ❌ 合并失败: {e}（已回滚）")
+            reports.append(f"       备份目录中可恢复原文件")
 
     if dry_run:
         reports.append("\n\n使用 --fix apply 执行合并")
@@ -1048,49 +1219,79 @@ def backup_memory(memory_dir: str) -> str:
 # 生成一个漂亮的网页报告，可以在浏览器里打开看。
 
 def generate_dashboard(result: AnalysisResult) -> str:
-    """生成独立的 HTML 仪表盘网页。
+    """生成独立的 HTML 仪表盘网页 — Neon Bento 设计风格。
 
-    这个页面是自包含的（所有 CSS 样式都写在页面里），
-    可以直接在浏览器打开，不需要联网。
-
-    包含：
-      - 综合评分（带进度条）
-      - 命中率数据
-      - 节省预估
-      - 配置状态
-      - 优化建议列表
+    自包含（所有 CSS/内联），零网络依赖。
     """
     score = result.overall_score
-    bar_filled = score // 5
-    bar_empty = 20 - bar_filled
-    bar = "█" * bar_filled + "░" * bar_empty
-
+    cfg = result.config
     hit = f"{result.current_hit_rate:.2f}%" if result.has_ccswitch_data else "N/A"
     cost_total = f"${result.total_cost:.4f}" if result.has_ccswitch_data else "N/A"
-    savings = f"${result.projected_savings_monthly:.2f}/月" if result.has_ccswitch_data else "N/A"
+    savings = f"${result.projected_savings_monthly:.2f}" if result.has_ccswitch_data else "N/A"
+    sav_pct = f"{result.projected_savings_percent:.1f}%" if result.has_ccswitch_data else "N/A"
 
-    # 生成优化建议的 HTML
+    # 命中率语义色
+    if result.has_ccswitch_data:
+        if result.current_hit_rate >= 99:
+            hit_color = "#10b981"
+        elif result.current_hit_rate >= 95:
+            hit_color = "#3b82f6"
+        elif result.current_hit_rate >= 80:
+            hit_color = "#f59e0b"
+        else:
+            hit_color = "#ef4444"
+    else:
+        hit_color = "#94a3b8"
+
+    # 分数环颜色
+    if score >= 90:
+        gauge_color = "#10b981"
+    elif score >= 70:
+        gauge_color = "#3b82f6"
+    elif score >= 50:
+        gauge_color = "#f59e0b"
+    else:
+        gauge_color = "#ef4444"
+
+    # 圆环 SVG — stroke-dasharray 计算
+    circumference = 2 * 3.14159 * 68  # r=68
+    offset = circumference * (1 - score / 100)
+
+    # 优化建议 HTML
+    sev_colors = {"critical": ("#ef4444", "rgba(239,68,68,0.12)"),
+                  "warning": ("#f59e0b", "rgba(245,158,11,0.12)"),
+                  "info": ("#06b6d4", "rgba(6,182,212,0.12)"),
+                  "success": ("#10b981", "rgba(16,185,129,0.12)")}
+    sev_labels = {"critical": "严重", "warning": "警告", "info": "提示", "success": "通过"}
+
     recs_html = ""
-    sev_color = {"critical": "#dc3545", "warning": "#ffc107", "info": "#0d6efd", "success": "#198754"}
-    for i, rec in enumerate(result.recommendations, 1):
-        color = sev_color.get(rec["severity"], "#6c757d")
-        recs_html += f"""
-        <div class="rec" style="border-left: 4px solid {color};">
-            <div class="rec-header">
-                <span class="rec-num">#{i}</span>
-                <span class="rec-sev" style="background:{color};">{rec['severity']}</span>
-                <span class="rec-cat">{rec['category']}</span>
-            </div>
-            <div class="rec-title">{rec['title']}</div>
-            <div class="rec-body">
-                <p><strong>详情:</strong> {rec['detail']}</p>
-                <p><strong>影响:</strong> {rec['impact']}</p>
-                <p><strong>修复:</strong> {rec['fix']}</p>
-            </div>
-        </div>"""
+    if result.recommendations:
+        severity_order = {"critical": 0, "warning": 1, "info": 2, "success": 3}
+        sorted_recs = sorted(result.recommendations,
+                             key=lambda x: severity_order.get(x["severity"], 99))
+        for i, rec in enumerate(sorted_recs, 1):
+            color, bg = sev_colors.get(rec["severity"], ("#6b7280", "rgba(107,114,128,0.12)"))
+            label = sev_labels.get(rec["severity"], rec["severity"])
+            recs_html += f"""
+            <details class="rec" style="--rec-color:{color};--rec-bg:{bg};">
+                <summary class="rec-summary">
+                    <span class="rec-badge sev-{rec['severity']}">{label}</span>
+                    <span class="rec-cat">{rec['category']}</span>
+                    <span class="rec-title-text">{rec['title']}</span>
+                </summary>
+                <div class="rec-body">
+                    <div class="rec-row"><span class="rec-label">详情</span><span>{rec['detail']}</span></div>
+                    <div class="rec-row"><span class="rec-label">影响</span><span>{rec['impact']}</span></div>
+                    <div class="rec-row"><span class="rec-label">修复</span><span>{rec['fix']}</span></div>
+                </div>
+            </details>"""
 
-    cfg = result.config
-    # 完整的 HTML 页面（深色主题，类似 GitHub 风格）
+    # 记忆文件列表
+    mem_list_html = ""
+    if cfg.memory_file_list:
+        for name, size in sorted(cfg.memory_file_list, key=lambda x: -x[1])[:5]:
+            mem_list_html += f"<div class='mem-item'><span class='mem-name'>{name}</span><span class='mem-size'>{size:,} B</span></div>"
+
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1099,85 +1300,287 @@ def generate_dashboard(result: AnalysisResult) -> str:
 <title>命中缓存99% — 诊断报告</title>
 <style>
 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-       background: #0d1117; color: #c9d1d9; padding: 20px; }}
-.container {{ max-width: 900px; margin: 0 auto; }}
-h1 {{ color: #58a6ff; margin-bottom: 24px; font-size: 24px; }}
-h2 {{ color: #58a6ff; margin: 28px 0 16px; font-size: 18px;
-       border-bottom: 1px solid #21262d; padding-bottom: 8px; }}
-.card {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; margin-bottom: 16px; }}
-.grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }}
-.stat {{ text-align: center; padding: 12px; }}
-.stat-value {{ font-size: 28px; font-weight: 700; color: #f0f6fc; }}
-.stat-label {{ font-size: 13px; color: #8b949e; margin-top: 4px; }}
-.score-bar {{ font-size: 18px; letter-spacing: 2px; margin: 8px 0; }}
-.rec {{ background: #0d1117; border-radius: 6px; padding: 16px; margin-bottom: 12px; }}
-.rec-header {{ display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }}
-.rec-num {{ color: #8b949e; font-weight: 600; }}
-.rec-sev {{ color: #fff; font-size: 11px; padding: 2px 8px; border-radius: 10px; text-transform: uppercase; }}
-.rec-cat {{ color: #8b949e; font-size: 12px; }}
-.rec-title {{ font-weight: 600; margin-bottom: 8px; }}
-.rec-body {{ font-size: 13px; color: #8b949e; line-height: 1.6; }}
-.rec-body p {{ margin-bottom: 4px; }}
-.config-table {{ width: 100%; font-size: 13px; border-collapse: collapse; }}
-.config-table td {{ padding: 6px 12px; border-bottom: 1px solid #21262d; }}
-.config-table td:first-child {{ color: #8b949e; width: 140px; }}
-.highlight {{ color: #f0f6fc; font-weight: 600; }}
-.green {{ color: #3fb950; }}
-.yellow {{ color: #d29922; }}
-.footer {{ text-align: center; color: #484f58; font-size: 12px; margin-top: 32px; }}
+body {{
+    font-family: -apple-system, 'PingFang SC', 'Noto Sans SC', system-ui, sans-serif;
+    background: #0a0e17; color: #e2e8f0; min-height: 100vh;
+    background-image:
+        radial-gradient(ellipse at 20% 50%, rgba(99,102,241,0.06) 0%, transparent 50%),
+        radial-gradient(ellipse at 80% 20%, rgba(6,182,212,0.04) 0%, transparent 50%);
+}}
+.container {{ max-width: 960px; margin: 0 auto; padding: 32px 16px; }}
+
+/* ── 头部 ── */
+.header {{ text-align: center; margin-bottom: 32px; }}
+.header h1 {{
+    font-size: 28px; font-weight: 700;
+    background: linear-gradient(135deg, #6366f1, #06b6d4);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    background-clip: text;
+}}
+.header .subtitle {{ color: #64748b; font-size: 14px; margin-top: 4px; }}
+
+/* ── Bento Grid ── */
+.bento {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
+.bento-full {{ grid-column: 1 / -1; }}
+
+/* ── 玻璃态卡片 ── */
+.card {{
+    background: rgba(17,24,39,0.8);
+    backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 12px; padding: 24px;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.2);
+    transition: border-color 0.2s, box-shadow 0.2s;
+}}
+.card:hover {{ border-color: rgba(255,255,255,0.1); box-shadow: 0 8px 32px rgba(0,0,0,0.3); }}
+.card-title {{
+    font-size: 13px; font-weight: 600; color: #64748b;
+    text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 16px;
+}}
+
+/* ── 评分圆环 ── */
+.gauge-wrap {{ display: flex; flex-direction: column; align-items: center; gap: 12px; }}
+.gauge-svg {{ width: 160px; height: 160px; }}
+.gauge-bg {{ fill: none; stroke: rgba(255,255,255,0.06); stroke-width: 8; }}
+.gauge-fg {{ fill: none; stroke: {gauge_color}; stroke-width: 8;
+    stroke-linecap: round; stroke-dasharray: {circumference};
+    stroke-dashoffset: {offset}; transform: rotate(-90deg);
+    transform-origin: 80px 80px; transition: stroke-dashoffset 1s ease-out;
+}}
+.gauge-text {{
+    font-family: 'JetBrains Mono', 'SF Mono', monospace;
+    font-size: 36px; font-weight: 700; fill: #f1f5f9;
+}}
+.gauge-label {{ font-size: 12px; fill: #64748b; }}
+.gauge-diagnosis {{ font-size: 14px; color: #94a3b8; text-align: center; }}
+
+/* ── KPI 指标 ── */
+.kpis {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }}
+.kpi {{
+    padding: 16px; border-radius: 8px;
+    background: rgba(255,255,255,0.02);
+    text-align: center;
+}}
+.kpi-value {{
+    font-family: 'JetBrains Mono', 'SF Mono', monospace;
+    font-size: 28px; font-weight: 700; color: #f1f5f9;
+}}
+.kpi-value.highlight {{ color: {hit_color}; }}
+.kpi-label {{ font-size: 12px; color: #64748b; margin-top: 4px; }}
+
+/* ── 进度条 ── */
+.progress-wrap {{ margin-top: 16px; }}
+.progress-bar {{
+    height: 8px; border-radius: 4px; background: rgba(255,255,255,0.06);
+    overflow: hidden; position: relative;
+}}
+.progress-fill {{
+    height: 100%; border-radius: 4px;
+    background: linear-gradient(90deg, #6366f1, #06b6d4);
+    width: {result.current_hit_rate if result.has_ccswitch_data else 0}%;
+    transition: width 1s ease-out;
+}}
+.progress-label {{
+    display: flex; justify-content: space-between;
+    font-size: 12px; color: #64748b; margin-top: 6px;
+}}
+
+/* ── 配置表 ── */
+.config-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }}
+.config-item {{
+    display: flex; justify-content: space-between;
+    padding: 8px 12px; border-radius: 6px;
+    background: rgba(255,255,255,0.02);
+    font-size: 13px;
+}}
+.config-key {{ color: #64748b; }}
+.config-value {{ color: #e2e8f0; font-weight: 500; }}
+.config-value.dynamic {{ color: #f59e0b; }}
+
+.mem-list {{ margin-top: 8px; }}
+.mem-item {{
+    display: flex; justify-content: space-between;
+    padding: 4px 0; font-size: 12px; color: #94a3b8;
+}}
+.mem-name {{ color: #e2e8f0; }}
+.mem-size {{ font-family: 'JetBrains Mono', monospace; color: #64748b; }}
+
+/* ── 优化建议 ── */
+.rec {{
+    border-left: 4px solid var(--rec-color);
+    border-radius: 8px; margin-bottom: 12px;
+    overflow: hidden; transition: border-left-width 0.2s;
+}}
+.rec:hover {{ border-left-width: 6px; }}
+.rec-summary {{
+    display: flex; align-items: center; gap: 8px;
+    padding: 12px 16px; cursor: pointer;
+    background: var(--rec-bg);
+    list-style: none; font-size: 13px;
+    transition: background 0.2s;
+}}
+.rec-summary::-webkit-details-marker {{ display: none; }}
+.rec-summary:hover {{ background: color-mix(in srgb, var(--rec-bg) 80%, white 5%); }}
+.rec-badge {{
+    font-size: 10px; font-weight: 600; padding: 1px 7px;
+    border-radius: 8px; text-transform: uppercase;
+    color: #fff; background: var(--rec-color);
+    flex-shrink: 0;
+}}
+.rec-cat {{ color: #64748b; font-size: 11px; flex-shrink: 0; }}
+.rec-title-text {{ color: #e2e8f0; font-weight: 500; }}
+.rec-body {{
+    padding: 12px 16px; font-size: 13px;
+    border-top: 1px solid rgba(255,255,255,0.04);
+}}
+.rec-row {{ display: flex; gap: 8px; margin-bottom: 6px; }}
+.rec-row:last-child {{ margin-bottom: 0; }}
+.rec-label {{
+    color: #64748b; flex-shrink: 0; min-width: 40px;
+    font-weight: 500;
+}}
+
+/* ── 空状态 ── */
+.empty {{ text-align: center; padding: 24px; color: #475569; font-size: 14px; }}
+
+/* ── 页脚 ── */
+.footer {{
+    text-align: center; color: #334155; font-size: 11px;
+    margin-top: 40px; padding-top: 16px;
+    border-top: 1px solid rgba(255,255,255,0.04);
+}}
+.footer a {{ color: #475569; text-decoration: none; }}
+
+/* ── 响应式 ── */
+@media (max-width: 640px) {{
+    .container {{ padding: 16px 12px; }}
+    .bento {{ grid-template-columns: 1fr; }}
+    .card {{ padding: 16px; }}
+    .kpis {{ grid-template-columns: 1fr 1fr; gap: 8px; }}
+    .config-grid {{ grid-template-columns: 1fr; }}
+    .kpi-value {{ font-size: 22px; }}
+    .gauge-svg {{ width: 120px; height: 120px; }}
+}}
 </style>
 </head>
 <body>
 <div class="container">
-<h1>🔍 命中缓存99% — 诊断报告</h1>
 
-<div class="card">
-    <h2>综合评分</h2>
-    <div style="text-align:center;padding:16px;">
-        <div style="font-size:48px;font-weight:700;">{score}/100</div>
-        <div class="score-bar">{bar}</div>
-        <div style="color:#8b949e;">{result.diagnosis}</div>
+<!-- 头部 -->
+<div class="header">
+    <h1>⚡ 命中缓存99%</h1>
+    <div class="subtitle">缓存命中率诊断报告 · {datetime.now().strftime('%Y-%m-%d %H:%M')}</div>
+</div>
+
+<div class="bento">
+    <!-- 综合评分 -->
+    <div class="card bento-full">
+        <div class="card-title">综合评分</div>
+        <div class="gauge-wrap">
+            <svg class="gauge-svg" viewBox="0 0 160 160">
+                <circle class="gauge-bg" cx="80" cy="80" r="68"/>
+                <circle class="gauge-fg" cx="80" cy="80" r="68"/>
+                <text class="gauge-text" x="80" y="68" text-anchor="middle">{score}</text>
+                <text class="gauge-label" x="80" y="90" text-anchor="middle">/ 100</text>
+            </svg>
+            <div class="gauge-diagnosis">{result.diagnosis}</div>
+        </div>
     </div>
-</div>
 
-<div class="card">
-    <h2>命中率分析</h2>
-    <div class="grid">
-        <div class="stat"><div class="stat-value">{hit}</div><div class="stat-label">当前命中率</div></div>
-        <div class="stat"><div class="stat-value">{cost_total}</div><div class="stat-label">总成本</div></div>
-        <div class="stat"><div class="stat-value">{result.total_requests}</div><div class="stat-label">请求数</div></div>
-        <div class="stat"><div class="stat-value">{(result.avg_input_per_request + result.avg_cache_per_request):.0f}</div><div class="stat-label">平均上下文/请求</div></div>
+    <!-- 命中率分析 -->
+    <div class="card bento-full">
+        <div class="card-title">命中率分析</div>
+        <div class="kpis">
+            <div class="kpi">
+                <div class="kpi-value highlight">{hit}</div>
+                <div class="kpi-label">当前命中率</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-value">{cost_total}</div>
+                <div class="kpi-label">总成本</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-value">{result.total_requests}</div>
+                <div class="kpi-label">请求数</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-value">{result.avg_input_per_request:.0f}</div>
+                <div class="kpi-label">平均新增/请求 (tokens)</div>
+            </div>
+        </div>
+        {f'''
+        <div class="progress-wrap">
+            <div class="progress-bar"><div class="progress-fill"></div></div>
+            <div class="progress-label">
+                <span>当前: {result.current_hit_rate:.1f}%</span>
+                <span>目标: {result.target_hit_rate:.0f}%</span>
+            </div>
+        </div>''' if result.has_ccswitch_data else ''}
     </div>
-</div>
 
-<div class="card">
-    <h2>节省预估</h2>
-    <div class="grid">
-        <div class="stat"><div class="stat-value green">{savings}</div><div class="stat-label">预估月省</div></div>
-        <div class="stat"><div class="stat-value green">{result.projected_savings_percent:.1f}%</div><div class="stat-label">节省比例</div></div>
+    <!-- 节省预估 -->
+    <div class="card bento-full">
+        <div class="card-title">节省预估</div>
+        <div class="kpis">
+            <div class="kpi">
+                <div class="kpi-value" style="color:#10b981;">{savings}</div>
+                <div class="kpi-label">预估月省</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-value" style="color:#10b981;">{sav_pct}</div>
+                <div class="kpi-label">节省比例</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-value">{result.projected_new_cost:.4f}</div>
+                <div class="kpi-label">优化后日成本</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-value">{result.avg_cache_per_request:.0f}</div>
+                <div class="kpi-label">平均缓存读取/请求</div>
+            </div>
+        </div>
     </div>
-</div>
 
-<div class="card">
-    <h2>配置状态</h2>
-    <table class="config-table">
-        <tr><td>CLAUDE.md</td><td>{cfg.claude_md_size} bytes {"⚠️ 含动态内容" if cfg.claude_md_has_dynamic else ""}</td></tr>
-        <tr><td>记忆文件</td><td>{cfg.memory_file_count} 个, 共 {cfg.memory_total_size} bytes</td></tr>
-        <tr><td>已启技能</td><td>{cfg.skill_count} 个</td></tr>
-        <tr><td>MCP 服务</td><td>{cfg.mcp_count} 个</td></tr>
-        <tr><td>对话历史</td><td>{cfg.history_size_mb:.1f} MB</td></tr>
-    </table>
-</div>
+    <!-- 配置状态 -->
+    <div class="card bento-full">
+        <div class="card-title">配置状态</div>
+        <div class="config-grid">
+            <div class="config-item">
+                <span class="config-key">系统提示</span>
+                <span class="config-value">{cfg.claude_md_size:,} bytes, {cfg.claude_md_lines} 行{' <span class="config-value dynamic">⚠️ 含动态内容</span>' if cfg.claude_md_has_dynamic else ''}</span>
+            </div>
+            <div class="config-item">
+                <span class="config-key">记忆文件</span>
+                <span class="config-value">{cfg.memory_file_count} 个 / {cfg.memory_total_size:,} bytes</span>
+            </div>
+            <div class="config-item">
+                <span class="config-key">已启技能</span>
+                <span class="config-value">{cfg.skill_count} 个</span>
+            </div>
+            <div class="config-item">
+                <span class="config-key">MCP 服务</span>
+                <span class="config-value">{cfg.mcp_count} 个</span>
+            </div>
+            <div class="config-item">
+                <span class="config-key">对话历史</span>
+                <span class="config-value">{cfg.history_size_mb:.1f} MB</span>
+            </div>
+        </div>
+        {f'<div class="mem-list">{mem_list_html}</div>' if mem_list_html else ''}
+    </div>
 
-<div class="card">
-    <h2>优化建议 ({len(result.recommendations)} 项)</h2>
-    {recs_html}
+    <!-- 优化建议 -->
+    <div class="card bento-full">
+        <div class="card-title">优化建议 ({len(result.recommendations)} 项)</div>
+        {recs_html if recs_html else '<div class="empty">🎉 无优化建议，配置状态良好</div>'}
+    </div>
 </div>
 
 <div class="footer">
-    命中缓存99% · 报告生成: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+    命中缓存99% · 报告生成: {datetime.now().strftime('%Y-%m-%d %H:%M')} ·
+    <a href="https://github.com/yunzhi-chu/mingzhonghuancun99" target="_blank">GitHub</a>
 </div>
+
 </div>
 </body>
 </html>"""
@@ -1256,7 +1659,7 @@ def main():
     # --setup 模式：自动安装配置
     # ═══════════════════════════════════════════════════════════
     if args.setup:
-        print("\n=== 命中缓存99% — 自动安装配置 ===\n")
+        print("\n=== 命中缓存99% — 检测 CC-Switch 状态 ===\n")
 
         agent_list = agents.detect_all()
         if not agent_list:
@@ -1264,26 +1667,26 @@ def main():
             print("   请先安装 Claude Code / Codex / Hermes / OpenClaw 其中之一")
             sys.exit(1)
 
-        configured = 0
-        for agent in agent_list:
-            print(f"配置 {agent.display}...")
-            # 确保 CCSwitch 已安装
-            ccs = ccsm.ensure_ccswitch(auto_install=True)
-            if not ccs["installed"]:
-                print(f"  ❌ CCSwitch 安装失败，跳过 {agent.display}")
-                print(ccsm.__MANUAL_GUIDE__)
-                continue
-            # 配置 agent 走 CCSwitch 代理
-            ccsm.configure_for_agent(agent)
-            print(f"  ✅ 已配置 CCSwitch 代理")
-            configured += 1
-
-        if configured > 0:
-            print(f"\n✅ 配置完成！CCSwitch 正在后台收集数据...")
-            print("   运行 --optimize 进行完整优化")
+        ccs = ccsm.ensure_ccswitch()
+        csm = "✅" if ccs["installed"] else "❌"
+        print(f"  {csm} CC-Switch: {'已安装' if ccs['installed'] else '未检测到'}")
+        if ccs["installed"]:
+            if ccs.get("agents"):
+                print(f"  已启用代理: {', '.join(ccs['agents'])}")
+            for agent in agent_list:
+                cfg = ccsm.configure_for_agent(agent)
+                proxy = cfg.get("proxy") or {}
+                if proxy.get("enabled"):
+                    prov = cfg.get("provider")
+                    print(f"  ✅ {agent.display}: 代理已启用 ({proxy['listen_address']}:{proxy['listen_port']})")
+                    if prov and prov.get("name"):
+                        print(f"     当前供应商: {prov['name']}")
+                else:
+                    print(f"  ⚠️ {agent.display}: 代理未启用")
+                    print(f"     请在 CC-Switch 桌面端开启 {agent.display} 的代理开关")
+            print(f"\n配置完成！运行 --optimize 进行完整优化")
         else:
-            print("\n⚠️ 未完成配置。可跳过 CCSwitch 直接使用：")
-            print("   python -m cache_optimizer --data data.txt")
+            print(ccsm.__MANUAL_GUIDE__)
         sys.exit(0)
 
     # ═══════════════════════════════════════════════════════════
@@ -1314,23 +1717,33 @@ def main():
 
         # 步骤3: 从 CCSwitch 获取使用数据
         print("步骤3/4: 从 CCSwitch 获取使用数据...")
+        ccswitch_data = None
         data = ccsm.fetch_data()
         if data and data.get("raw"):
-            print(f"  ✅ 获取到数据 ({len(data.get('requests', []))} 条请求)")
+            try:
+                ccswitch_data = CCSwitchData.parse(data["raw"])
+                print(f"  ✅ 获取到数据 ({ccswitch_data.total_requests} 条请求, "
+                      f"命中率 {ccswitch_data.hit_rate:.1f}%)")
+            except Exception as e:
+                print(f"  ⚠️ 数据解析失败: {e}")
         else:
             print("  ⚠️ CCSwitch 暂无数据")
             print("  [1] 等待 CCSwitch 收集数据后重试")
             print("  [2] 或现在从 CCSwitch 仪表盘导出数据: python -m cache_optimizer --data data.txt")
 
-        # 为每个 agent 配置 CCSwitch 代理
+        # 获取每个 agent 的 CC-Switch 代理配置
         for agent in agent_list:
-            ccsm.configure_for_agent(agent)
-            print(f"  ✅ 已为 {agent.display} 配置 CCSwitch 代理")
+            cfg = ccsm.configure_for_agent(agent)
+            proxy = cfg.get("proxy") or {}
+            if proxy.get("enabled"):
+                print(f"  ✅ {agent.display} 代理状态: 已启用")
+            else:
+                print(f"  ⚠️ {agent.display} 代理未开启，数据可能不完整")
 
         # 步骤4: 分析 + 修复建议
         print("步骤4/4: 扫描配置并优化...")
-        config = scan_config(str(agent_list[0].config_dir))
-        result = analyze(None, config, args.target)
+        config = scan_all_configs(agent_list)
+        result = analyze(ccswitch_data, config, args.target)
         if result.overall_score >= 95:
             print(f"  ✅ 当前缓存健康度 {result.overall_score}/100，无需优化")
         else:
@@ -1434,8 +1847,8 @@ def main():
             print("提示: 数据应为 CCSwitch 导出的 Tab 分隔格式")
             sys.exit(1)
 
-    # 2. 扫描配置
-    config = scan_config(args.config)
+    # 2. 扫描配置（自动检测所有 agent）
+    config = scan_all_configs()
 
     # 3. 分析
     result = analyze(ccswitch, config, args.target)

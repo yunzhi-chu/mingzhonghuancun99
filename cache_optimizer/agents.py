@@ -245,56 +245,63 @@ def _detect_generic() -> AgentInfo | None:
 
 
 def detect_ccswitch() -> dict:
-    """检测 CCSwitch 是否已安装。
+    """检测 CC-Switch（CCSwitch）是否已安装。
 
-    CCSwitch 是什么？
-      一个代理工具，可以记录所有 AI API 请求日志。
-      我们的工具需要它的数据来分析缓存命中率。
+    CC-Switch 是一个桌面应用（Electron），通过系统托盘运行。
+    它在本机开了正向代理（127.0.0.1:15721），记录所有 AI API 请求到 SQLite。
 
-    检测方法（三重检查）：
-      1. 命令行有没有 ccswitch 或 ccswitch-cli 命令
-      2. Python 有没有安装 ccswitch 包
-      3. 常见安装路径下有没有 config.json
+    检测方法：
+      1. SQLite 数据库 ~/.cc-switch/cc-switch.db 是否存在
+      2. 设置文件 ~/.cc-switch/settings.json 是否存在
+      3. 代理端口 15721 是否可达
     """
-    result = {"installed": False, "version": "", "path": "", "config": {}}
+    result = {"installed": False, "version": "", "path": "", "config": {},
+              "db_path": "", "proxy_port": 0, "agents": []}
 
-    # 方法1：有没有命令行工具
-    cc_cmd = shutil.which("ccswitch") or shutil.which("ccswitch-cli")
-    if cc_cmd:
+    cc_switch_dir = Path.home() / ".cc-switch"
+    if not cc_switch_dir.exists():
+        return result
+
+    # 检查 SQLite 数据库
+    db_path = cc_switch_dir / "cc-switch.db"
+    if db_path.exists():
         result["installed"] = True
-        result["path"] = cc_cmd
+        result["path"] = str(cc_switch_dir)
+        result["db_path"] = str(db_path)
+
+    # 读取 settings.json 获取代理信息和版本
+    sf = cc_switch_dir / "settings.json"
+    if sf.exists():
         try:
-            out = subprocess.run([cc_cmd, "--version"], capture_output=True, text=True, timeout=5)
-            result["version"] = out.stdout.strip() or out.stderr.strip()
+            settings = json.loads(sf.read_text(encoding="utf-8"))
+            result["config"] = settings
+            # 看看代理端口
+            if settings.get("enableLocalProxy"):
+                # 从 proxy_config 表拿端口更准，这里只是 fallback
+                result["proxy_port"] = 15721
+            # 如果有版本字段
+            result["version"] = settings.get("version", "桌面版")
         except Exception:
-            result["version"] = "<= 1.0"
-        return result
+            pass
 
-    # 方法2：是不是 Python 包
-    try:
-        import importlib.metadata
-        version = importlib.metadata.version("ccswitch")
-        result["installed"] = True
-        result["version"] = f"Python {version}"
-        result["path"] = "pip: ccswitch"
-        return result
-    except (ImportError, ModuleNotFoundError):
-        pass
-
-    # 方法3：常见安装目录下有没有配置文件
-    for p in [
-        Path.home() / ".ccswitch",
-        Path.home() / "ccswitch",
-        Path("/opt/ccswitch"),
-    ]:
-        if p.exists() and (p / "config.json").exists():
-            result["installed"] = True
-            result["path"] = str(p)
+    # 从 SQLite 读取代理配置和已启用的 agent
+    if result["installed"]:
+        try:
+            import sqlite3
+            conn = sqlite3.connect(str(db_path))
+            cur = conn.cursor()
+            # 获取代理配置
             try:
-                result["config"] = json.loads((p / "config.json").read_text(encoding="utf-8"))
+                cur.execute("SELECT app_type, listen_port, enabled FROM proxy_config")
+                for row in cur.fetchall():
+                    if row[2]:  # enabled
+                        result["agents"].append(row[0])
+                        result["proxy_port"] = row[1]
             except Exception:
                 pass
-            return result
+            conn.close()
+        except Exception:
+            pass
 
     return result
 
@@ -322,15 +329,14 @@ def print_agents(agents: list[AgentInfo]):
 
 
 def print_ccswitch(ccs: dict):
-    """打印 CCSwitch 的检测结果。
-
-    ccs 参数是 detect_ccswitch() 返回的字典。
-    """
+    """打印 CC-Switch 的检测结果。"""
     if ccs["installed"]:
-        print(f"  ✅ CCSwitch v{ccs['version']}")
-        print(f"     路径: {ccs['path']}")
-        if ccs.get("config"):
-            print(f"     配置: {json.dumps(ccs['config'], ensure_ascii=False)}")
+        print(f"  ✅ CC-Switch {ccs['version']}")
+        print(f"     数据目录: {ccs['path']}")
+        print(f"     数据库: {ccs.get('db_path', 'N/A')}")
+        print(f"     代理端口: {ccs.get('proxy_port', 'N/A')}")
+        if ccs.get("agents"):
+            print(f"     已启用代理: {', '.join(ccs['agents'])}")
     else:
-        print("  ❌ CCSwitch 未安装")
-        print("     使用 --setup 自动安装")
+        print("  ❌ CC-Switch 未安装")
+        print("     这是一个桌面应用。如果已安装，确保 ~/.cc-switch/ 目录存在。")

@@ -1,90 +1,61 @@
-"""CCSwitch 管理 — 自动安装、配置、获取数据。
+"""CC-Switch 管理 — 检测、读取代理配置、从 SQLite 获取使用数据。
 
-CCSwitch 是什么？
-  它是一个"中间人"代理工具，放在你和 AI API 之间。
-  所有你发给 AI 的请求都会经过它，它会记录下来：
-  - 什么时候发的
-  - 用了什么模型
-  - 发了多少字（tokens）
-  - 其中多少命中了缓存
-  - 花了多少钱
+CC-Switch 是什么？
+  一个桌面应用（Electron），放在你和 AI API 之间做\"中间人\"。
+  所有你发给 AI 的请求都会经过它的本地代理（127.0.0.1:15721），
+  它会记录到 SQLite 数据库：
+  - 时间、供应商、模型
+  - 输入/输出/缓存读取 token
+  - 成本
 
-本模块负责：
-  1. 检测 CCSwitch 有没有装
-  2. 没装就自动装
-  3. 配置让 AI agent 走 CCSwitch 代理
-  4. 从 CCSwitch 拉取使用数据
+本模块不再尝试安装 CC-Switch（它是桌面应用，不是 pip 包），
+而是直接读取它的 SQLite 数据库。
 """
 
 import json
 import os
-import subprocess
-import sys
-import time
+import sqlite3
 from pathlib import Path
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from .agents import AgentInfo, detect_ccswitch
 
-
-# CCSwitch 的 pip 包名
-CCSWITCH_PIP = "ccswitch"
-# 如果 pip 装不上，就从 GitHub 克隆（TODO: 发布后替换为真实仓库地址）
-CCSWITCH_GIT = "https://github.com/your-org/ccswitch.git"
+# CC-Switch 数据目录
+CC_SWITCH_DIR = Path.home() / ".cc-switch"
+CC_DB = CC_SWITCH_DIR / "cc-switch.db"
 
 
 def ensure_ccswitch(auto_install: bool = True) -> dict:
-    """确保 CCSwitch 已安装。没装的话自动安装。
+    """检测 CC-Switch 是否已安装。
+
+    CC-Switch 是桌面应用，无法自动安装。
+    如果没装，给出引导提示。
 
     参数：
-      auto_install: 如果没装，是否自动安装（默认是 True）
-
-    返回值：
-      detect_ccswitch() 的结果字典，包含 installed/version/path 等
-    """
-    ccs = detect_ccswitch()
-    if ccs["installed"]:
-        return ccs  # 已经装好了，直接返回
-
-    if not auto_install:
-        return ccs  # 用户不让自动装，那就返回未安装状态
-
-    print("🚀 正在自动安装 CCSwitch...")
-    return install_ccswitch()
-
-
-def install_ccswitch() -> dict:
-    """安装 CCSwitch。
-
-    尝试两种方法，哪个成功了就用哪个：
-      方法1: pip install（最快，推荐）
-      方法2: git clone 然后 pip install（备选）
+      auto_install: 保留参数，仅用于兼容。实际什么也不装。
 
     返回值：
       detect_ccswitch() 的结果字典
     """
-    methods = [
-        _install_pip,
-        _install_git,
-    ]
+    ccs = detect_ccswitch()
+    if ccs["installed"]:
+        return ccs
 
-    for method in methods:
-        try:
-            result = method()
-            if result["installed"]:
-                print(f"  ✅ CCSwitch 安装成功: v{result['version']}")
-                return result
-        except Exception as e:
-            print(f"  ⚠️ 安装方式失败: {e}")
+    if not auto_install:
+        return ccs
 
-    return {"installed": False, "version": "", "path": "", "error": "所有安装方式均失败"}
+    print("  ⚠️ CC-Switch 未检测到。请确认桌面端已启动。")
+    print("     CC-Switch 是一个桌面应用（系统托盘图标），不是 pip 包。")
+    print("     如果已安装，检查 ~/.cc-switch/ 目录是否存在。")
+    return ccs
 
 
-# 当 CCSwitch 装不上时，告诉用户手动操作的方法
+# 当 CC-Switch 装不上时，告诉用户手动操作的方法
 __MANUAL_GUIDE__ = """
-CCSwitch 未安装或安装失败。你仍可手动使用本工具：
+CC-Switch 未检测到或数据库不可用。你仍可手动使用本工具：
 
-  1. 从 CCSwitch 仪表盘复制请求日志（Tab 分隔格式）
+  1. 从 CC-Switch 仪表盘复制请求日志（Tab 分隔格式）
   2. 运行: python -m cache_optimizer
   3. 粘贴数据，Ctrl+D 结束
 
@@ -92,61 +63,147 @@ CCSwitch 未安装或安装失败。你仍可手动使用本工具：
 """
 
 
-def _install_pip() -> dict:
-    """方法1：通过 pip 安装 CCSwitch。
+def _time_to_ts(t: datetime) -> str:
+    """把 datetime 转成 CC-Switch 日志里的时间戳格式。
 
-    pip 是 Python 的包管理器，就像手机上的应用商店。
-    这一行命令相当于在应用商店搜索安装 CCSwitch：
-      pip install ccswitch
+    例如: 2026-06-06 18:00:00
     """
-    print("  方法1: pip install...")
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", CCSWITCH_PIP],
-        capture_output=True, text=True, timeout=120,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"pip 安装失败: {result.stderr[:200]}")
-
-    # 装完了再检测一次，确认装上了
-    return detect_ccswitch()
+    return t.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _install_git() -> dict:
-    """方法2：通过 git clone 安装。
+def fetch_data(period: str = "today") -> Optional[dict]:
+    """从 CC-Switch SQLite 数据库获取使用数据。
 
-    如果 pip 装不上（比如网络问题），就用 git 把代码下载到本地再装。
-    相当于从 GitHub 上下载源码然后手动安装。
+    直接查 proxy_request_logs 表，把数据格式化成 Tab 分隔文本，
+    与 CCSwitchData.parse() 兼容。
+
+    参数：
+      period: 时间范围 — 'today'（今天）, '7d'（近7天）, '30d'（近30天）, 'all'
+
+    返回值：
+      dict 包含：
+        raw:      Tab 分隔的文本（可直接喂给 CCSwitchData.parse()）
+        requests: 结构化请求列表
+        summary:  摘要统计
+        如果数据库不存在或没有数据，返回 None
     """
-    import shutil
-    git = shutil.which("git")
-    if not git:
-        raise RuntimeError("git 未安装")  # 没装 git，这条路走不通
+    ccs = detect_ccswitch()
+    if not ccs["installed"] or not ccs.get("db_path"):
+        return None
 
-    target = Path.home() / ".ccswitch"
-    target.mkdir(parents=True, exist_ok=True)
+    db = ccs["db_path"]
+    if not os.path.exists(db):
+        return None
 
-    print(f"  方法2: git clone {CCSWITCH_GIT}")
-    result = subprocess.run(
-        [git, "clone", CCSWITCH_GIT, str(target / "repo")],
-        capture_output=True, text=True, timeout=120,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"git clone 失败: {result.stderr[:200]}")
+    # 计算时间范围
+    now = datetime.now(timezone.utc)
+    if period == "today":
+        cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "7d":
+        cutoff = now - timedelta(days=7)
+    elif period == "30d":
+        cutoff = now - timedelta(days=30)
+    else:
+        cutoff = datetime(2000, 1, 1, tzinfo=timezone.utc)
 
-    # 克隆下来后，再用 pip 安装本地代码
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", str(target / "repo")],
-        capture_output=True, text=True, timeout=120,
-    )
+    cutoff_ts = int(cutoff.timestamp())  # SQLite 存的 created_at 是秒级时间戳
 
-    return detect_ccswitch()
+    try:
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        # 查数据
+        cur.execute("""
+            SELECT created_at, app_type, model, input_tokens, output_tokens,
+                   cache_read_tokens, total_cost_usd, status_code, data_source
+            FROM proxy_request_logs
+            WHERE created_at >= ?
+            ORDER BY created_at ASC
+        """, (cutoff_ts,))
+        rows = cur.fetchall()
+
+        if not rows:
+            conn.close()
+            return {
+                "raw": None,
+                "requests": [],
+                "summary": {"total_requests": 0},
+            }
+
+        # 格式化成 Tab 分隔文本
+        # 格式: time \t provider \t model \t new_input \t R_cache \t output \t cost \t ttf \t status \t source
+        lines = [("时间\t供应商\t模型\t新增输入\tR缓存读取\t输出\t费用\t首token延迟\t状态\t来源")]
+        requests_structured = []
+
+        for row in rows:
+            created_at_ms = row["created_at"]
+            created_at_dt = datetime.fromtimestamp(created_at_ms, tz=timezone.utc)
+            time_str = created_at_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+            provider = row["app_type"]  # claude / codex / gemini
+            model = row["model"] or "unknown"
+            new_input = row["input_tokens"] or 0
+            cache_read = row["cache_read_tokens"] or 0
+            output_tokens = row["output_tokens"] or 0
+            cost_str = row["total_cost_usd"] or "0"
+            try:
+                cost = float(cost_str)
+            except (ValueError, TypeError):
+                cost = 0.0
+            status = "success" if row["status_code"] == 200 else f"error_{row['status_code']}"
+            source = row["data_source"] or "proxy"
+
+            # Tab 分隔一行
+            line = f"{time_str}\t{provider}\t{model}\t{new_input}\tR{cache_read}\t{output_tokens}\t${cost:.6f}\t0\t{status}\t{source}"
+            lines.append(line)
+
+            requests_structured.append({
+                "time": time_str,
+                "provider": provider,
+                "model": model,
+                "new_input": new_input,
+                "cache_read": cache_read,
+                "output": output_tokens,
+                "cost": cost,
+                "status": status,
+                "source": source,
+            })
+
+        # 统计汇总
+        total_new = sum(r["input_tokens"] or 0 for r in rows)
+        total_cache = sum(r["cache_read_tokens"] or 0 for r in rows)
+        total_output = sum(r["output_tokens"] or 0 for r in rows)
+        total_cost = sum(float(r["total_cost_usd"] or 0) for r in rows)
+        total_context = total_new + total_cache
+        hit_rate = (total_cache / total_context * 100) if total_context > 0 else 0
+
+        summary = {
+            "total_requests": len(rows),
+            "total_new_input": total_new,
+            "total_cache_read": total_cache,
+            "total_output": total_output,
+            "total_cost": round(total_cost, 4),
+            "hit_rate": round(hit_rate, 2),
+        }
+
+        conn.close()
+
+        return {
+            "raw": "\n".join(lines),
+            "requests": requests_structured,
+            "summary": summary,
+        }
+
+    except sqlite3.Error:
+        return None
 
 
 def configure_for_agent(agent: AgentInfo) -> dict:
-    """为指定的 AI agent 配置 CCSwitch 代理。
+    """读取 CC-Switch 为指定 agent 配置的代理信息。
 
-    简单说：告诉 agent "你的请求先经过 CCSwitch 再发给 AI 厂商"。
-    这样 CCSwitch 才能记录到所有请求数据。
+    CC-Switch 桌面端已经配好了代理。本函数只读，不改。
+    从 proxy_config 表读取代理设置，从 providers 表读取当前供应商。
 
     参数：
       agent: 之前检测到的 agent 信息（AgentInfo 对象）
@@ -159,177 +216,85 @@ def configure_for_agent(agent: AgentInfo) -> dict:
         "agent_display": agent.display,
         "config_dir": str(agent.config_dir),
         "proxy": None,
+        "provider": None,
     }
 
-    # 不同 agent 有不同的代理配置方式
-    if agent.name == "claude":
-        # Claude Code 通过环境变量 ANTHROPIC_BASE_URL 设置代理
-        config["proxy"] = {
-            "type": "env",
-            "variables": {
-                "ANTHROPIC_BASE_URL": os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
-            },
-        }
-        # 检查 Claude 的 settings.json 里是否已经配了代理
-        sf = agent.config_dir / "settings.json"
-        if sf.exists():
-            try:
-                data = json.loads(sf.read_text(encoding="utf-8"))
-                env = data.get("env", {})
-                if "ANTHROPIC_BASE_URL" in env:
-                    config["proxy"]["current"] = env["ANTHROPIC_BASE_URL"]
-            except Exception:
-                pass
+    ccs = detect_ccswitch()
+    if not ccs["installed"] or not ccs.get("db_path"):
+        return config
 
-    elif agent.name == "codex":
-        # Codex CLI 通过环境变量 OPENAI_BASE_URL 设置代理
-        config["proxy"] = {
-            "type": "env",
-            "variables": {"OPENAI_BASE_URL": os.environ.get("OPENAI_BASE_URL", "https://api.openai.com")},
-        }
+    app_type = agent.name  # claude / codex / gemini
 
-    # 把配置保存到 ~/.ccswitch/agents.json 文件里
-    ccs_config_dir = Path.home() / ".ccswitch"
-    ccs_config_dir.mkdir(parents=True, exist_ok=True)
-    config_file = ccs_config_dir / "agents.json"
+    try:
+        conn = sqlite3.connect(ccs["db_path"])
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
 
-    # 先读取已有的配置（如果有的话）
-    existing = {}
-    if config_file.exists():
-        try:
-            existing = json.loads(config_file.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        # 获取代理配置
+        cur.execute("""
+            SELECT listen_address, listen_port, enabled, proxy_enabled
+            FROM proxy_config WHERE app_type = ?
+        """, (app_type,))
+        proxy_row = cur.fetchone()
+        if proxy_row:
+            config["proxy"] = {
+                "listen_address": proxy_row["listen_address"],
+                "listen_port": proxy_row["listen_port"],
+                "enabled": bool(proxy_row["enabled"]),
+                "proxy_enabled": bool(proxy_row["proxy_enabled"]),
+            }
 
-    # 新配置覆盖旧配置，然后写回文件
-    existing[agent.name] = config
-    config_file.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+        # 获取当前提供商
+        cur.execute("""
+            SELECT p.name, p.settings_config, p.website_url, p.category,
+                   pe.url as endpoint
+            FROM providers p
+            LEFT JOIN provider_endpoints pe ON pe.provider_id = p.id AND pe.app_type = p.app_type
+            WHERE p.app_type = ? AND p.is_current = 1
+            LIMIT 1
+        """, (app_type,))
+        prov_row = cur.fetchone()
+        if prov_row:
+            config["provider"] = {
+                "name": prov_row["name"],
+                "endpoint": prov_row["endpoint"] or "",
+                "category": prov_row["category"] or "",
+            }
+
+        conn.close()
+    except sqlite3.Error:
+        pass
 
     return config
 
 
-def fetch_data() -> Optional[dict]:
-    """从 CCSwitch 获取使用数据。
-
-    三种获取方式，按优先级尝试：
-      方法1: 运行 ccswitch export 命令行导出
-      方法2: 读取本地缓存文件
-      方法3: 访问 CCSwitch 的本地 HTTP API
-
-    返回值：
-      dict 包含 requests（请求列表）、summary（摘要）、raw（原始数据）
-      如果 CCSwitch 没装，返回 None
-    """
-    ccs = detect_ccswitch()
-    if not ccs["installed"]:
-        return None  # CCSwitch 没装，拿不到数据
-
-    data = {
-        "requests": [],
-        "summary": {},
-        "raw": None,
-    }
-
-    # 方法1: 使用 ccswitch 命令行的 export 功能导出 JSON 数据
-    cc_cmd = None
-    for cmd_name in ["ccswitch", "ccswitch-cli"]:
-        found = shutil_which(cmd_name)
-        if found:
-            cc_cmd = found
-            break
-
-    if cc_cmd:
-        try:
-            # 导出今天的数据
-            result = subprocess.run(
-                [cc_cmd, "export", "--format", "json", "--period", "today"],
-                capture_output=True, text=True, timeout=30,
-            )
-            if result.returncode == 0:
-                data["raw"] = result.stdout
-                parsed = json.loads(result.stdout)
-                if isinstance(parsed, dict):
-                    data["summary"] = parsed.get("summary", parsed)
-                    data["requests"] = parsed.get("requests", [])
-                return data
-        except Exception:
-            pass
-
-    # 方法2: 读取 CCSwitch 在本地缓存的文件
-    cache_files = [
-        Path.home() / ".ccswitch" / "cache" / "today.json",
-        Path.home() / ".ccswitch" / "data" / "requests.jsonl",
-    ]
-    for cf in cache_files:
-        if cf.exists():
-            try:
-                data["raw"] = cf.read_text(encoding="utf-8")
-                data["source"] = str(cf)
-                if cf.suffix == ".json":
-                    parsed = json.loads(data["raw"])
-                    data["summary"] = parsed if isinstance(parsed, dict) else {}
-                return data
-            except Exception:
-                pass
-
-    # 方法3: 通过 HTTP API 获取
-    # CCSwitch 默认在本机的 8008 端口开了一个 API 服务
-    api_url = "http://localhost:8008"
-    try:
-        import urllib.request
-        from urllib.parse import urlparse
-
-        # 安全限制：只允许重定向到 localhost，防止 SSRF 攻击
-        # SSRF 攻击是什么？就是攻击者诱导服务器去访问内部网络的地址
-        class _LocalOnlyRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, req, fp, code, msg, headers, newurl):
-                parsed = urlparse(newurl)
-                if parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
-                    return None  # 不是本机地址，拒绝重定向
-                return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-        opener = urllib.request.build_opener(_LocalOnlyRedirect)
-        resp = opener.open(f"{api_url}/api/usage/today", timeout=10)
-        if resp.status == 200:
-            data["raw"] = resp.read().decode("utf-8")
-            parsed = json.loads(data["raw"])
-            data["summary"] = parsed if isinstance(parsed, dict) else {}
-            return data
-    except Exception:
-        pass
-
-    return data  # 所有方法都失败了，返回空数据
-
-
-def shutil_which(cmd: str) -> Optional[str]:
-    """跨平台查找可执行文件的路径。
-
-    比如在 Windows 上输入 "notepad"，它会返回 "C:\\Windows\\System32\\notepad.exe"。
-    相当于在命令行里输入 where（Windows）或 which（Mac/Linux）。
-    """
-    import shutil
-    return shutil.which(cmd)
-
-
 def print_setup_result(agent: Optional[AgentInfo], ccs: dict, config: Optional[dict]):
-    """打印安装和配置的结果到屏幕上。
-
-    参数：
-      agent: 检测到的 agent 信息
-      ccs:   CCSwitch 检测结果
-      config: 代理配置结果
-    """
+    """打印检测和配置的结果到屏幕上。"""
     print()
     print("━" * 50)
-    print("安装与配置结果")
+    print("CC-Switch 状态")
     print("━" * 50)
     if agent:
         status = "✅" if agent.is_installed else "❌"
         print(f"  Agent: {status} {agent.display}")
     ccs_status = "✅" if ccs.get("installed") else "❌"
-    print(f"  CCSwitch: {ccs_status} v{ccs.get('version', 'N/A')}")
+    print(f"  CC-Switch: {ccs_status}")
+    if ccs.get("installed"):
+        if ccs.get("db_path"):
+            db_size = os.path.getsize(ccs["db_path"]) / (1024 * 1024)
+            print(f"  数据库: {ccs['db_path']} ({db_size:.0f} MB)")
+        if ccs.get("proxy_port"):
+            print(f"  代理端口: 127.0.0.1:{ccs['proxy_port']}")
+        if ccs.get("agents"):
+            print(f"  已启用代理: {', '.join(ccs['agents'])}")
     if config:
-        print(f"  代理配置: ✅ 已为 {config['agent_display']} 配置")
-        if config.get("proxy", {}).get("current"):
-            print(f"  当前代理: {config['proxy']['current']}")
+        proxy = config.get("proxy") or {}
+        if proxy.get("enabled"):
+            print(f"  代理状态: ✅ 已启用")
+            print(f"  代理地址: {proxy.get('listen_address', '127.0.0.1')}:{proxy.get('listen_port', 'N/A')}")
+        if config.get("provider"):
+            pr = config["provider"]
+            print(f"  当前供应商: {pr.get('name', 'N/A')}")
+            if pr.get("endpoint"):
+                print(f"  代理终点: {pr['endpoint']}")
     print()
