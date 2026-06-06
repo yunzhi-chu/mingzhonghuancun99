@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mingzhonghuancun99"
-version = "0.1.0"
+version = "1.0.0"
 description = "命中缓存99% — 缓存命中率诊断、修复与监控仪表盘"
 readme = "README.md"
 authors = []
