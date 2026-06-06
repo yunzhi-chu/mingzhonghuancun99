@@ -374,32 +374,13 @@ def scan_codex_config() -> ConfigScanResult:
     result = ConfigScanResult()
 
     # ── 检查 AGENTS.md（系统提示）───────────────────────────
+    # 只检查文件大小，不检查动态内容（用户指定不需要）
     ag = codex_dir / "AGENTS.md"
     if ag.exists():
         content = ag.read_text(encoding="utf-8")
         result.claude_md_size = len(content.encode("utf-8"))
         result.claude_md_lines = content.count("\n") + 1
 
-        dynamic_patterns = [
-            (r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", "日期"),
-            (r"\d{2}:\d{2}", "时间"),
-            (r"今天|昨天|明天|星期[一二三四五六日]", "相对日期"),
-            ("CURRENT_DATE|currentDate|{{.*}}", "模板变量"),
-        ]
-        dynamic_items = []
-        for pat, name in dynamic_patterns:
-            if re.search(pat, content):
-                dynamic_items.append(name)
-        result.claude_md_has_dynamic = len(dynamic_items) > 0
-        if dynamic_items:
-            result.issues.append(ConfigIssue(
-                severity="warning",
-                category="claude_md",
-                title="AGENTS.md 含动态内容（Codex）",
-                detail=f"检测到: {', '.join(dynamic_items)}。动态内容使每次请求的前缀发生变化，导致 cache miss。",
-                impact="每次 CI/build 类操作都产生新前缀，命中率损失约 0.1-0.5%",
-                fix="将动态内容移至运行时变量或独立记忆文件。"
-            ))
         if result.claude_md_size > 2048:
             result.issues.append(ConfigIssue(
                 severity="info",
